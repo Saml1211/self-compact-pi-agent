@@ -10,6 +10,8 @@ Context lifecycle management for the [Pi coding agent](https://github.com/earend
 | 80% | Asks the model to call `self_compact` now. Any other tool call ends the turn, and the compaction uses a generic note |
 | 88% | Ends the turn at the next tool call and compacts with a generic note |
 
+Percentages are of the **working window**: the model's context window, capped at 300K tokens. On a 1M-token model, 70/80/88% of the whole window (about 734K/839K/922K) is past the point where answer quality drops, and Pi's own compaction (window minus 16,384) would fire first. With the cap, the thresholds sit at 210K/240K/264K. Models with windows of 300K or less are unaffected.
+
 Pi's built-in auto-compaction fires at `contextWindow - reserveTokens` (default 16384), about 92% on 200K, 94% on 272K and 98% on 1M, so every stage above happens first.
 
 **Auto-resume.** Two compaction paths used to leave the agent idle:
@@ -32,7 +34,7 @@ It does not resume after overflow recovery (Pi already retries), after a plain `
 
 ## Configuration
 
-`PI_SELF_COMPACT_WARNING_PCT` (nudge), `PI_SELF_COMPACT_AUTO_PCT` and `PI_SELF_COMPACT_FORCE_PCT` override the thresholds. They must satisfy nudge < auto < force; otherwise all three fall back to the defaults. `PI_SELF_COMPACT_JEV=false` disables the Jev audit. Nothing runs in pi-crew subagents.
+`PI_SELF_COMPACT_WARNING_PCT` (nudge), `PI_SELF_COMPACT_AUTO_PCT` and `PI_SELF_COMPACT_FORCE_PCT` override the thresholds. They must satisfy nudge < auto < force; otherwise all three fall back to the defaults. `PI_SELF_COMPACT_WORKING_WINDOW` sets the cap in tokens (default `300000`; `0` uses the model's whole window). `PI_SELF_COMPACT_JEV=false` disables the Jev audit. Nothing runs in pi-crew subagents.
 
 ## Verification
 

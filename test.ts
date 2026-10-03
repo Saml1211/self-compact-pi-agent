@@ -341,3 +341,16 @@ function harness() {
 }
 
 console.log("\nALL TESTS PASSED");
+
+// Working-window cap: on a 1M-token model the thresholds are % of 300K, not of 1M
+{
+  const { usagePercent } = await import("./index.ts");
+  const ctxOf = (u: any) => ({ getContextUsage: () => u }) as any;
+  const big = { tokens: 240_000, contextWindow: 1_048_576, percent: 23 };
+  assert.equal(usagePercent(ctxOf(big), DEFAULT_CONFIG.workingWindowTokens), 80, "240K of a 300K working window = 80%");
+  assert.equal(usagePercent(ctxOf(big), 0), 23, "0 disables the cap: Pi's own percent");
+  assert.equal(usagePercent(ctxOf({ tokens: 150_000, contextWindow: 200_000, percent: 75 }), 300_000), 75, "small windows unchanged");
+  assert.equal(resolveConfig({ PI_SELF_COMPACT_WORKING_WINDOW: "0" } as any).workingWindowTokens, 0);
+  assert.equal(resolveConfig({ PI_SELF_COMPACT_WORKING_WINDOW: "x" } as any).workingWindowTokens, 300_000, "invalid → default");
+  console.log("✓ working-window cap: 1M models compact at 80% of 300K, small windows unchanged, env override");
+}

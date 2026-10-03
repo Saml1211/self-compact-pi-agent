@@ -16,6 +16,7 @@ export interface SelfCompactConfig {
   autoCompactPct: number; // compact autonomously with a generic note if the model ignored the nudge
   forcePct: number; // stop the run immediately (block + terminate) and compact with a generic note
   jevEnabled: boolean; // audit continuation notes with TypeSafe Jev
+  workingWindowTokens: number; // thresholds are % of min(contextWindow, this); 0 = the model's whole window
 }
 
 export const DEFAULT_CONFIG: SelfCompactConfig = {
@@ -23,6 +24,9 @@ export const DEFAULT_CONFIG: SelfCompactConfig = {
   autoCompactPct: 80,
   forcePct: 88,
   jevEnabled: true,
+  // On a 1M-token model, 70/80/88% of the whole window is ~734K/839K/922K: past where quality drops,
+  // and Pi's own compaction (window - 16384) fires first. Cap the working window instead.
+  workingWindowTokens: 300_000,
 };
 
 function sanitizeThreshold(val: any, fallback: number, min = 10, max = 99): number {
@@ -160,10 +164,13 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): SelfCompact
     autoCompactPct: sanitizeThreshold(env.PI_SELF_COMPACT_AUTO_PCT, DEFAULT_CONFIG.autoCompactPct),
     forcePct: sanitizeThreshold(env.PI_SELF_COMPACT_FORCE_PCT, DEFAULT_CONFIG.forcePct),
     jevEnabled: env.PI_SELF_COMPACT_JEV !== "false",
+    workingWindowTokens: /^\d+$/.test(env.PI_SELF_COMPACT_WORKING_WINDOW ?? "")
+      ? Number(env.PI_SELF_COMPACT_WORKING_WINDOW)
+      : DEFAULT_CONFIG.workingWindowTokens,
   };
   // Mis-ordered overrides would make a later stage fire first; fall back wholesale.
   if (!(cfg.nudgePct < cfg.autoCompactPct && cfg.autoCompactPct < cfg.forcePct)) {
-    return { ...DEFAULT_CONFIG, jevEnabled: cfg.jevEnabled };
+    return { ...DEFAULT_CONFIG, jevEnabled: cfg.jevEnabled, workingWindowTokens: cfg.workingWindowTokens };
   }
   return cfg;
 }
@@ -181,10 +188,12 @@ function isSubagent(): boolean {
   return process.env.PI_CREW_KIND === "subagent" || Boolean(process.env.PI_CREW_DEPTH && process.env.PI_CREW_DEPTH !== "0");
 }
 
-function usagePercent(ctx: ExtensionContext): number | null {
+export function usagePercent(ctx: ExtensionContext, workingWindow = 0): number | null {
   const usage = ctx.getContextUsage?.();
   if (!usage || usage.tokens === null || !usage.contextWindow) return null;
-  return usage.percent ?? Math.round((usage.tokens / usage.contextWindow) * 100);
+  const window = workingWindow > 0 ? Math.min(workingWindow, usage.contextWindow) : usage.contextWindow;
+  if (window === usage.contextWindow && usage.percent != null) return usage.percent;
+  return Math.round((usage.tokens / window) * 100);
 }
 
 // Per-workspace backup so one repo's note is never replayed into another (pi-prime reads this
@@ -231,7 +240,7 @@ export default function (pi: ExtensionAPI) {
       safeNotify(ctx, `[self-compact] Stopped auto-resume after ${resumeStreak} compactions in a row; context is not shrinking enough. Continue manually.`, "warning");
       return false;
     }
-    const after = safeUsage(ctx);
+    const after = safeUsage(ctx, config.workingWindowTokens);
     if (after !== null && after >= config.autoCompactPct) {
       safeNotify(ctx, `[self-compact] Compaction left context at ${after}%; not auto-resuming.`, "warning");
       return false;
@@ -376,7 +385,7 @@ export default function (pi: ExtensionAPI) {
       };
     }
     if (isSubagent() || compactionFailed) return;
-    const percent = safeUsage(ctx);
+    const percent = safeUsage(ctx, config.workingWindowTokens);
     if (percent === null || percent < config.forcePct) return;
     schedule(ctx, genericNote(percent));
     safeNotify(ctx, `[self-compact] Context at ${percent}%: stopping this turn to compact.`, "warning");
@@ -392,7 +401,7 @@ export default function (pi: ExtensionAPI) {
     resumeAtSettle = false;
     supersededNote = null;
     if (isSubagent() || compacting || pending) return;
-    const percent = safeUsage(ctx);
+    const percent = safeUsage(ctx, config.workingWindowTokens);
     if (percent === null) return;
     if (percent < config.autoCompactPct) resumeStreak = 0; // real progress with headroom
 
@@ -507,9 +516,9 @@ function safeNotify(ctx: ExtensionContext, msg: string, level: "info" | "warning
   } catch {} // ctx is invalidated after shutdown and throws on access
 }
 
-function safeUsage(ctx: ExtensionContext): number | null {
+function safeUsage(ctx: ExtensionContext, workingWindow: number): number | null {
   try {
-    return usagePercent(ctx);
+    return usagePercent(ctx, workingWindow);
   } catch {
     return null;
   }
