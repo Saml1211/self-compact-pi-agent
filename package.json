@@ -1,10 +1,11 @@
 {
   "name": "self-compact-pi-agent",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Autonomous context lifecycle management & structured memory preservation for Pi Coding Agent",
   "main": "index.ts",
   "scripts": {
-    "test": "bun run test.ts"
+    "test": "bun run test.ts",
+    "e2e": "bun run e2e.ts"
   },
   "keywords": [
     "pi-extension",

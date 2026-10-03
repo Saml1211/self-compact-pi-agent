@@ -1,29 +1,38 @@
 # self-compact-pi-agent
 
-Autonomous context lifecycle management & structured memory preservation for the **Pi Coding Agent**, inspired by Dan Disler's ([IndyDevDan](https://github.com/disler)) *Automate Coding Agent Compaction (Context Window Engineering)*.
+Context lifecycle management for the [Pi coding agent](https://github.com/earendil-works/pi): the model writes its own continuation notes before history is compacted, and **the agent keeps working after any compaction** instead of waiting for you to type "continue".
 
-## Why this exists
+## What it does
 
-1. **Context Decay Prevention:** Coding models lose coherence and reasoning reliability as context fills up.
-2. **Autonomous Compaction Trigger:** At **78%** token pressure (before Pi's built-in 80-85% threshold), the extension autonomously triggers compaction with structured continuation state.
-3. **Auto-Continue (Zero Stalling):** Uses Pi's `agent_before_settle` lifecycle hook to automatically resume execution after compaction without requiring the human to manually send "continue".
-4. **TypeSafe Jev Quality Gates:** Audits continuation notes using System One (`jev-latest`) to verify completeness, readiness, and actionability before history is wiped.
-5. **Prompt Guidelines Memory Anchor:** Restores preserved notes into `promptGuidelines` so the model immediately regains orientation in the fresh post-compaction context.
+| Context usage | Action |
+| --- | --- |
+| 70% | Steer message to the model (it sees this, unlike a UI toast): call `self_compact` at the next boundary |
+| 80% | Auto-compacts with a generic note if the model ignored the nudge |
+| 88% | Blocks every tool except `self_compact` / `yield_control` |
+
+Pi's built-in auto-compaction fires at `contextWindow - reserveTokens` (default 16384), about 92% on 200K, 94% on 272K and 98% on 1M, so every stage above happens first.
+
+**Auto-resume.** Two compaction paths used to leave the agent idle:
+
+1. **`ctx.compact()`**, which the `self_compact` tool, `/self-compact` and the 80% trigger all use, aborts the running agent. The extension resumes it from `onComplete` with `pi.sendMessage(..., { triggerTurn: true })`, carrying the note. A failed compaction also resumes, and the 80% trigger stops retrying until some compaction succeeds.
+2. **Pi's built-in threshold compaction** after a run ends leaves nothing queued, so Pi settles. The extension's `agent_before_settle` hook returns `continue: true` with a continuation message.
+
+It does not resume after overflow recovery (Pi already retries), after a plain `/compact` you ran yourself, after `/self-compact` on an idle session, or after a compaction in the middle of a run (the agent is still working).
 
 ## Usage
 
-- Tool: `self_compact(note, customInstructions?)`
-- Command: `/self-compact [optional notes]`
+- Tool: `self_compact(note, customInstructions?)`. Notes are optionally audited by TypeSafe Jev (`TYPESAFE_API_KEY` or `~/.pi/agent/pi-jev.json`). The latest note is backed up atomically to `~/.pi/state/last-continuation-note.md` (0600).
+- Command: `/self-compact [notes]`
 
-## Thresholds
+## Configuration
 
-- **Notice (65%):** Periodic status notification.
-- **Warning (72%):** Strong recommendation to wrap active subtask.
-- **Auto-Compact (78%):** Autonomously triggers compaction before token window limits.
-- **Force Gate (85%):** Non-compaction tools locked until state is preserved.
+`PI_SELF_COMPACT_WARNING_PCT` (nudge), `PI_SELF_COMPACT_AUTO_PCT` and `PI_SELF_COMPACT_FORCE_PCT` override the thresholds. They must satisfy nudge < auto < force; otherwise all three fall back to the defaults. `PI_SELF_COMPACT_JEV=false` disables the Jev audit. Nothing runs in pi-crew subagents.
 
 ## Verification
 
 ```bash
-bun run test.ts
+bun run test.ts   # unit: event ordering, guards, no-resume cases
+bun run e2e.ts    # real Pi AgentSession + faux provider: both resume paths, no network
 ```
+
+Both need Pi's packages resolvable, for example `NODE_PATH=$(npm root -g):$(npm root -g)/@earendil-works/pi-coding-agent/node_modules`.
