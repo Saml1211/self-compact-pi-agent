@@ -34,7 +34,7 @@ It does not resume after overflow recovery (Pi already retries), after a plain `
 
 ```bash
 bun run test.ts   # unit: event ordering, guards, no-resume cases
-bun run e2e.ts    # real Pi AgentSession + faux provider: both resume paths + cancel = no resume, no network
+bun run e2e.ts    # real Pi AgentSession + faux provider: both resume paths; cancel and stop-during-audit = no resume; no network
 ```
 
 Both need Pi's packages resolvable, for example `NODE_PATH=$(npm root -g):$(npm root -g)/@earendil-works/pi-coding-agent/node_modules`.

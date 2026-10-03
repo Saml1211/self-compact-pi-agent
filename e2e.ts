@@ -107,4 +107,30 @@ assert.ok(!/SHOULD NOT RUN/.test(c.lastText), "cancelled compaction must not res
 assert.ok(!c.roles.includes("custom:self_compact_continuation"), "no continuation message after a cancel");
 console.log("✓ C: cancelled compaction does not resume");
 
+// D: user stops the agent while the Jev audit is in flight -> no compaction, no resume
+process.env.PI_SELF_COMPACT_JEV = "true";
+process.env.TYPESAFE_API_KEY = "test-key-not-real";
+const realFetch = globalThis.fetch;
+globalThis.fetch = ((_url: any, opts: any) =>
+  new Promise((_res, rej) => opts?.signal?.addEventListener("abort", () => rej(new Error("aborted"))))) as any; // audit hangs until aborted
+const dRun = await run(
+  "abort-during-audit",
+  1000,
+  [
+    fauxAssistantMessage("ack " + "z".repeat(3000)),
+    fauxAssistantMessage(fauxToolCall("self_compact", { note: "Goal: ship" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("## summary"),
+    fauxAssistantMessage("SHOULD NOT RUN"),
+  ],
+  ["background " + "context ".repeat(800), "do the task"],
+  (session, ev) => { if (ev.type === "tool_execution_start" && ev.toolName === "self_compact") setTimeout(() => session.abort(), 100); },
+);
+await new Promise((r) => setTimeout(r, 1500));
+globalThis.fetch = realFetch;
+process.env.PI_SELF_COMPACT_JEV = "false";
+delete process.env.TYPESAFE_API_KEY;
+assert.ok(!dRun.events.some((x) => x.startsWith("compaction_start")), "stopped during audit: no compaction");
+assert.ok(!/SHOULD NOT RUN/.test(dRun.lastText), "stopped during audit: no resume");
+console.log("✓ D: stop during the Jev audit neither compacts nor resumes");
+
 console.log("\nE2E PASSED");

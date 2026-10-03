@@ -297,16 +297,22 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: "[self-compact] A compaction is already in progress." }] };
       }
 
+      // A stopped tool must neither compact nor resume: check before and after the (network) audit.
+      const stopped = { content: [{ type: "text" as const, text: "[self-compact] Aborted; no compaction started." }] };
+      if (signal?.aborted) return stopped;
+
       let jevReport = "";
       if (config.jevEnabled && jevApiKey) {
         const audit = await auditContinuationNoteWithJev(note, jevApiKey, signal);
+        if (signal?.aborted || disposed) return stopped;
         if (audit) {
           jevReport = `\n[Jev Audit: ${audit.readiness.toUpperCase()} (Score: ${audit.completeness.toFixed(1)}/2.0, Actionable: ${Math.round(audit.actionable * 100)}%)]`;
           if (audit.readiness !== "ready") jevReport += " Warning: note may lack concrete next steps.";
         }
       }
 
-      resumeStreak = 0; // a deliberate model decision, not a loop
+      // No resumeStreak reset here: repeated model calls must not bypass the resume bound.
+      // It resets only on measured headroom (turn_end) or an explicit /self-compact.
       startCompaction(ctx, note, true, params.customInstructions ?? "");
       return {
         content: [

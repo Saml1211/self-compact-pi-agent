@@ -150,6 +150,29 @@ function harness() {
   console.log("✓ resume loop bounded (2), resets on headroom; no resume without headroom");
 }
 
+// 2g. Repeated model self_compact calls cannot bypass the resume bound
+{
+  const h = harness();
+  for (let i = 0; i < 5; i++) {
+    await h.tools.get("self_compact").execute("c" + i, { note: "n" + i }, undefined, () => {}, h.ctx);
+    await h.emit("turn_end"); // the tool-call turn ends while compacting: no streak reset
+    h.compacts.at(-1).onComplete({});
+  }
+  assert.equal(h.sent.filter((m) => m.options.triggerTurn).length, 2, "model-driven compactions bounded at 2 resumes");
+  console.log("✓ repeated self_compact calls bounded at 2 resumes");
+}
+
+// 2h. Aborted tool (before or during the audit) neither compacts nor resumes
+{
+  const h = harness();
+  const ac = new AbortController();
+  ac.abort();
+  const r = await h.tools.get("self_compact").execute("c1", { note: "n" }, ac.signal, () => {}, h.ctx);
+  assert.equal(h.compacts.length, 0, "aborted before audit: no compaction");
+  assert.match(r.content[0].text, /Aborted/);
+  console.log("✓ aborted tool: no compaction");
+}
+
 // 2f. Backups are per-workspace and the real home is never written
 {
   const h = harness();
