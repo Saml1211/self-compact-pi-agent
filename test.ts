@@ -50,7 +50,14 @@ function harness() {
     setUsage: (u: any) => (usageOverride = u),
     emit: (e: string, ev: any = {}) => handlers.get(e)!(ev, ctx),
     // a run that ends normally: Pi runs agent_before_settle, then agent_settled
-    settle: async () => { await handlers.get("agent_before_settle")!({}, ctx); await handlers.get("agent_settled")!({}, ctx); },
+    settle: async (outcome = "completed") => {
+      const was = idle;
+      idle = true; // a settled run is idle
+      await handlers.get("agent_before_settle")!({ outcome }, ctx);
+      await handlers.get("agent_settled")!({}, ctx);
+      await new Promise((r) => setTimeout(r, 160)); // compaction starts after a quiet period
+      idle = was;
+    },
   };
 }
 
@@ -90,6 +97,30 @@ function harness() {
   assert.equal(h.compacts.length, 0, "the dropped compaction does not come back later");
   assert.equal(await h.emit("tool_call", { toolName: "bash" }), undefined, "nothing left blocking tools");
   console.log("✓ user stop before the run settles: compaction dropped, no resume");
+}
+
+// 1c. Aborted/errored outcome never arms; another extension's continuation run goes first
+{
+  const h = harness();
+  await h.tools.get("self_compact").execute("c1", { note: "n" }, undefined, () => {}, h.ctx);
+  await h.settle("aborted");
+  assert.equal(h.compacts.length, 0, "aborted outcome: no compaction");
+  await h.tools.get("self_compact").execute("c2", { note: "n" }, undefined, () => {}, h.ctx);
+  await h.settle("error");
+  assert.equal(h.compacts.length, 0, "error outcome: no compaction");
+  // a run another extension starts from its settle handler: compaction waits for that run to settle
+  await h.tools.get("self_compact").execute("c3", { note: "Goal: later" }, undefined, () => {}, h.ctx);
+  await h.emit("agent_before_settle", { outcome: "completed" });
+  await h.emit("agent_settled");
+  await new Promise((r) => setTimeout(r, 30)); // a slow settle handler of another extension
+  await h.emit("agent_start"); // its deferred continuation began
+  await new Promise((r) => setTimeout(r, 160));
+  assert.equal(h.compacts.length, 0, "never compacts under another run");
+  assert.equal((await h.emit("tool_call", { toolName: "bash" }))?.terminate, true, "that run ends at its next tool call");
+  await h.settle();
+  assert.equal(h.compacts.length, 1);
+  assert.match(h.compacts[0].customInstructions, /Goal: later/);
+  console.log("✓ aborted/error outcomes never arm; a continuation queued by another extension runs first");
 }
 
 // 2. onError releases the guard, still resumes (the run stopped for it), and stops auto-retry loops

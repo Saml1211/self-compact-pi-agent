@@ -168,6 +168,7 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): SelfCompact
   return cfg;
 }
 
+const QUIET_MS = 100; // after settling, how long no other run may start before we compact
 export const CONTINUATION_CUSTOM_TYPE = "self_compact_continuation";
 
 export function continuationContent(note: string | null): string {
@@ -212,6 +213,7 @@ export default function (pi: ExtensionAPI) {
   // a stopped run drops the pending compaction instead of compacting and resuming against the stop.
   let pending: { note: string; extra: string } | null = null;
   let armed = false;
+  let runs = 0; // agent_start count: shows whether a run began after we settled
   let cancelled = false; // the in-flight compaction was aborted (user/extension cancel): never resume
   let disposed = false; // session shut down: callbacks must not touch the stale ctx
   let resumeAtSettle = false; // Pi's built-in compaction ran after the run ended
@@ -437,8 +439,13 @@ export default function (pi: ExtensionAPI) {
     if (!compacting && event.reason === "threshold" && !event.willRetry) resumeAtSettle = true;
   });
 
-  pi.on("agent_before_settle", async (_event, ctx: ExtensionContext) => {
-    if (pending) armed = true; // Pi only gets here when no abort was requested
+  pi.on("agent_start", async () => {
+    runs++;
+  });
+
+  pi.on("agent_before_settle", async (event: any, ctx: ExtensionContext) => {
+    // Pi only gets here when no abort was requested before the boundary; an aborted or failed run never arms.
+    if (pending && event?.outcome !== "aborted" && event?.outcome !== "error") armed = true;
     if (!resumeAtSettle) return;
     resumeAtSettle = false;
     const note = supersededNote;
@@ -456,13 +463,34 @@ export default function (pi: ExtensionAPI) {
     pending = null;
     armed = false;
     if (!job || disposed) return;
-    // ponytail: a stop pressed after agent_before_settle but before this event (other extensions'
-    // settle handlers) is invisible to extensions in Pi 1.0.0; the compaction itself can still be cancelled.
     if (!go) {
       safeNotify(ctx, "[self-compact] The run was stopped, so the scheduled compaction was skipped.", "info");
       return;
     }
-    startCompaction(ctx, job.note, true, job.extra);
+    // Wait out a short quiet period after the settle handlers: a continuation another extension queued
+    // there (Pi runs it right after them) goes first, and this compaction waits for that run to end.
+    // ponytail: Pi 1.0.0 shows extensions neither a stop pressed after agent_before_settle nor the end of
+    // other extensions' settle handlers. A stop in that window (handlers + QUIET_MS) is missed, and a
+    // handler slower than QUIET_MS can still overlap. A stop once compaction has started cancels it, and
+    // a cancelled compaction never resumes. Upgrade path: a Pi hook that runs after deferred settle actions.
+    const gen = runs;
+    let waited = 0;
+    const check = () => {
+      if (disposed || compacting) return;
+      let idle = false;
+      try { idle = ctx.isIdle(); } catch { return; }
+      if (runs !== gen || !idle) {
+        pending ??= job; // compact when that run settles
+        return;
+      }
+      if (waited < QUIET_MS) {
+        waited += 10;
+        setTimeout(check, 10);
+        return;
+      }
+      startCompaction(ctx, job.note, true, job.extra);
+    };
+    setTimeout(check, 0);
   });
 
   pi.on("session_shutdown", async () => {

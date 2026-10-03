@@ -17,6 +17,8 @@ import selfCompact from "./index.ts";
 process.env.PI_SELF_COMPACT_JEV = "false";
 process.env.PI_SELF_COMPACT_STATE_DIR = mkdtempSync(join(tmpdir(), "self-compact-e2e-")); // never the real backup
 
+let extra: any[] = []; // other extensions loaded beside self-compact
+let current: any;
 async function run(name: string, reserveTokens: number, responses: any[], prompts: string | string[], onEvent?: (session: any, e: any) => void) {
   const faux = fauxProvider({ models: [{ id: "faux", contextWindow: 20000, maxTokens: 500 }] });
   faux.setResponses(responses.map((r) => (typeof r === "function" ? r : () => ({ ...r, timestamp: Date.now() }))));
@@ -24,7 +26,7 @@ async function run(name: string, reserveTokens: number, responses: any[], prompt
   const modelRuntime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null });
   modelRuntime.registerNativeProvider(faux.provider);
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: true, reserveTokens, keepRecentTokens: 50 } });
-  const resourceLoader = new DefaultResourceLoader({ cwd: dir, agentDir: dir, settingsManager, extensionFactories: [selfCompact], noSkills: true, noPromptTemplates: true });
+  const resourceLoader = new DefaultResourceLoader({ cwd: dir, agentDir: dir, settingsManager, extensionFactories: [selfCompact, ...extra], noSkills: true, noPromptTemplates: true });
   await resourceLoader.reload();
   const { session } = await createAgentSession({
     cwd: dir,
@@ -36,6 +38,7 @@ async function run(name: string, reserveTokens: number, responses: any[], prompt
     noTools: true,
   } as any);
   await (session as any).bindExtensions?.({});
+  current = session;
   const events: string[] = [];
   session.subscribe((e: any) => {
     onEvent?.(session, e);
@@ -153,5 +156,57 @@ assert.ok(!eRun.events.some((x) => x.startsWith("compaction_start")), "stopped a
 assert.ok(!/SHOULD NOT RUN/.test(eRun.lastText), "stopped after the tool: no resume");
 assert.equal(eRun.pending, 2, "neither the summary nor the resume response was requested");
 console.log("✓ E: stop right after self_compact returns neither compacts nor resumes");
+
+// F: another extension continues the run from its (slow) agent_settled handler. Its run goes first;
+// the compaction starts only after that run has settled, never underneath it.
+let other = false;
+const overlaps: boolean[] = [];
+extra = [(pi: any) => pi.on("agent_settled", async () => {
+  if (other || !current.messages.some((m: any) => m.role === "toolResult" && m.toolName === "self_compact")) return;
+  other = true;
+  pi.sendMessage({ customType: "other", content: "do other work", display: true }, { triggerTurn: true });
+  await new Promise((r) => setTimeout(r, 20));
+})];
+const fRun = await run(
+  "other-extension-continues",
+  1000,
+  [
+    fauxAssistantMessage("ack " + "z".repeat(3000)),
+    fauxAssistantMessage(fauxToolCall("self_compact", { note: "Goal: ship" }), { stopReason: "toolUse" }),
+    // both slow, in either order (summary or other run), so an overlap would be caught in flight
+    async () => { await new Promise((r) => setTimeout(r, 150)); return fauxAssistantMessage("OTHER RUN DONE", { timestamp: Date.now() }); },
+    async () => { await new Promise((r) => setTimeout(r, 150)); return fauxAssistantMessage("## summary", { timestamp: Date.now() }); },
+    fauxAssistantMessage("RESUMED"),
+  ],
+  ["background " + "context ".repeat(800), "do the task"],
+  (session, ev) => { if (ev.type === "compaction_start" || ev.type === "compaction_end") overlaps.push(session.isStreaming); },
+);
+extra = [];
+assert.deepEqual(overlaps, [false, false], "no run may stream while the compaction is in flight");
+assert.equal(fRun.pending, 0);
+assert.match(fRun.lastText, /RESUMED/);
+console.log("✓ F: a run another extension starts at settle goes first; compaction never overlaps it");
+
+// G: mixed batch. A plain tool ran before self_compact in the same batch, so Pi makes one more model
+// request (it terminates only when every result does). Compaction and resume still happen afterwards.
+extra = [(pi: any) => pi.registerTool({ name: "plain", label: "plain", description: "plain", parameters: { type: "object", properties: {} }, execute: async () => ({ content: [{ type: "text", text: "plain" }] }) })];
+const gRun = await run(
+  "mixed-batch",
+  1000,
+  [
+    fauxAssistantMessage("ack " + "z".repeat(3000)),
+    fauxAssistantMessage([fauxToolCall("plain", {}), fauxToolCall("self_compact", { note: "Goal: ship" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("plain", {}), { stopReason: "toolUse" }), // the extra request: blocked, ends the turn
+    fauxAssistantMessage("## summary"),
+    fauxAssistantMessage("## turn prefix"), // the cut lands inside the turn: Pi also summarises the turn prefix
+    fauxAssistantMessage("RESUMED after mixed batch"),
+  ],
+  ["background " + "context ".repeat(800), "do the task"],
+);
+extra = [];
+assert.ok(gRun.events.includes("compaction_end:manual"), "mixed batch still compacts");
+assert.equal(gRun.pending, 0);
+assert.match(gRun.lastText, /RESUMED after mixed batch/);
+console.log("✓ G: mixed batch: one extra request, its tool call ends the turn, then compaction + resume");
 
 console.log("\nE2E PASSED");
