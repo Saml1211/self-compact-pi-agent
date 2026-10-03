@@ -8,17 +8,20 @@ import type {
 import { Type } from "@sinclair/typebox";
 
 // Default context pressure thresholds (percentage of context window used)
+// Set to trigger BEFORE Pi's default 80-85% built-in compaction threshold
 export interface SelfCompactConfig {
-  noticePct: number; // e.g. 70%: notify agent to find clean task milestone
-  warningPct: number; // e.g. 80%: strong recommendation to compact
-  forcePct: number; // e.g. 90%: lock tools, force compaction
+  noticePct: number; // e.g. 65%: notify agent
+  warningPct: number; // e.g. 72%: strong recommendation
+  autoCompactPct: number; // e.g. 78%: autonomously triggers compaction before built-in threshold
+  forcePct: number; // e.g. 85%: lock tools, force compaction
   jevEnabled: boolean; // whether to run TypeSafe Jev quality checks on continuation notes
 }
 
 const DEFAULT_CONFIG: SelfCompactConfig = {
-  noticePct: 70,
-  warningPct: 80,
-  forcePct: 90,
+  noticePct: 65,
+  warningPct: 72,
+  autoCompactPct: 78,
+  forcePct: 85,
   jevEnabled: true,
 };
 
@@ -154,6 +157,7 @@ export function writeNoteBackupAtomic(backupPath: string, content: string): bool
 export default function (pi: ExtensionAPI) {
   let pendingCarryoverNote: string | null = null;
   let activeInjectedNote: string | null = null;
+  let justCompacted = false;
   let lastNoticeTime = 0;
   let lastWarningTime = 0;
 
@@ -162,12 +166,14 @@ export default function (pi: ExtensionAPI) {
 
   const notice = sanitizeThreshold(process.env.PI_SELF_COMPACT_NOTICE_PCT, DEFAULT_CONFIG.noticePct);
   const warning = sanitizeThreshold(process.env.PI_SELF_COMPACT_WARNING_PCT, DEFAULT_CONFIG.warningPct);
+  const autoCompact = sanitizeThreshold(process.env.PI_SELF_COMPACT_AUTO_PCT, DEFAULT_CONFIG.autoCompactPct);
   const force = sanitizeThreshold(process.env.PI_SELF_COMPACT_FORCE_PCT, DEFAULT_CONFIG.forcePct);
 
   const config: SelfCompactConfig = {
-    noticePct: Math.min(notice, warning - 1),
+    noticePct: notice,
     warningPct: warning,
-    forcePct: Math.max(force, warning + 1),
+    autoCompactPct: autoCompact,
+    forcePct: force,
     jevEnabled: process.env.PI_SELF_COMPACT_JEV === "false" ? false : DEFAULT_CONFIG.jevEnabled,
   };
 
@@ -193,7 +199,6 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      // Robust resolution of context and cancellation signal
       const effectiveCtx: ExtensionContext | undefined = ctx || (signal && typeof (signal as any).compact === "function" ? (signal as any) : undefined);
       const effectiveSignal: AbortSignal | undefined = signal instanceof AbortSignal ? signal : effectiveCtx?.signal;
 
@@ -279,7 +284,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // 4. Turn End Watchdog (Notice & Warning Thresholds)
+  // 4. Turn End Watchdog (Autonomous compaction trigger & early warnings)
   pi.on("turn_end", async (_event, ctx: ExtensionContext) => {
     if (process.env.PI_CREW_KIND === "subagent") {
       return;
@@ -293,7 +298,24 @@ export default function (pi: ExtensionAPI) {
     const percent = usage.percent ?? Math.round((usage.tokens / usage.contextWindow) * 100);
     const now = Date.now();
 
-    if (percent >= config.warningPct && percent < config.forcePct) {
+    // AUTONOMOUS COMPACTION TRIGGER: Triggers at 78% before Pi's built-in 80-85% threshold
+    if (percent >= config.autoCompactPct) {
+      const autoNote = `Autonomous self-compaction triggered at ${percent}% token usage to preserve state before window exhaustion.`;
+      pendingCarryoverNote = pendingCarryoverNote || autoNote;
+      writeNoteBackupAtomic(noteBackupPath, pendingCarryoverNote);
+
+      ctx.ui?.notify?.(
+        `[self-compact] Autonomously triggering compaction at ${percent}% context usage...`,
+        "warning",
+      );
+
+      ctx.compact?.({
+        customInstructions: `AUTONOMOUS CONTEXT COMPACTION (Triggered at ${percent}% token pressure):\n${pendingCarryoverNote}`,
+      });
+      return;
+    }
+
+    if (percent >= config.warningPct && percent < config.autoCompactPct) {
       if (now - lastWarningTime > 45000) {
         lastWarningTime = now;
         ctx.ui?.notify?.(
@@ -321,6 +343,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_compact", async () => {
+    justCompacted = true;
     if (pendingCarryoverNote) {
       activeInjectedNote = pendingCarryoverNote;
       pendingCarryoverNote = null;
@@ -334,6 +357,26 @@ export default function (pi: ExtensionAPI) {
       const guidelines = (event.promptGuidelines = event.promptGuidelines || []);
       guidelines.push(`[PRESERVED CONTINUATION NOTES FROM SELF-COMPACTION]:\n${activeInjectedNote}`);
       activeInjectedNote = null;
+    }
+  });
+
+  // 7. Auto-Continue Boundary Hook: Automatically continues execution post-compaction
+  // Eliminates the need for the user to manually send "continue" after compaction!
+  pi.on("agent_before_settle", async () => {
+    if (justCompacted) {
+      justCompacted = false;
+      return {
+        continue: true,
+        entries: [
+          {
+            type: "custom_message",
+            customType: "self_compact_continuation",
+            content:
+              "[SYSTEM: Context compaction completed successfully. Preserved continuation state has been restored into prompt guidelines. Resume and continue executing your active task immediately without waiting for user input.]",
+            display: true,
+          },
+        ],
+      };
     }
   });
 }
