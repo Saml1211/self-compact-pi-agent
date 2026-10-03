@@ -1,6 +1,6 @@
 {
   "name": "self-compact-pi-agent",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Autonomous context lifecycle management & structured memory preservation for Pi Coding Agent",
   "main": "index.ts",
   "scripts": {
@@ -12,7 +12,8 @@
     "compaction",
     "context-window",
     "indydevdan",
-    "typesafe-jev"
+    "typesafe-jev",
+    "pi-package"
   ],
   "author": "Sam Lyndon",
   "license": "MIT",
@@ -20,5 +21,10 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
   }
 }
