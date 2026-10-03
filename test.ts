@@ -1,7 +1,13 @@
 import assert from "node:assert";
-import register, { resolveConfig, DEFAULT_CONFIG, CONTINUATION_CUSTOM_TYPE } from "./index.ts";
+import { mkdtempSync, readFileSync, existsSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import register, { resolveConfig, DEFAULT_CONFIG, CONTINUATION_CUSTOM_TYPE, noteBackupPathFor } from "./index.ts";
 
 process.env.PI_SELF_COMPACT_JEV = "false"; // no network in tests
+// Never write the real ~/.pi/state backup (Bun caches homedir() at start, so HOME can't be swapped)
+const stateDir = mkdtempSync(join(tmpdir(), "sc-state-"));
+process.env.PI_SELF_COMPACT_STATE_DIR = stateDir;
 delete process.env.PI_CREW_KIND;
 delete process.env.PI_CREW_DEPTH;
 
@@ -20,16 +26,28 @@ function harness() {
   const compacts: any[] = [];
   let percent = 10;
   let idle = false;
+  let usageOverride: any;
   const ctx: any = {
-    compact: (opts: any) => compacts.push(opts),
+    cwd: "/work/repo-a",
+    // Like Pi: right after a compaction, usage is unknown (tokens: null) until the next response
+    compact: (opts: any) =>
+      compacts.push({
+        ...opts,
+        onComplete: (r: any) => {
+          const explicit = usageOverride !== undefined;
+          if (!explicit) usageOverride = { tokens: null, contextWindow: 100000, percent: null };
+          try { opts.onComplete(r); } finally { if (!explicit) usageOverride = undefined; }
+        },
+      }),
     ui: { notify: () => {} },
     isIdle: () => idle,
-    getContextUsage: () => ({ tokens: percent * 1000, contextWindow: 100000, percent }),
+    getContextUsage: () => usageOverride ?? { tokens: percent * 1000, contextWindow: 100000, percent },
   };
   return {
     tools, commands, handlers, sent, compacts, ctx,
     setPercent: (p: number) => (percent = p),
     setIdle: (v: boolean) => (idle = v),
+    setUsage: (u: any) => (usageOverride = u),
     emit: (e: string, ev: any = {}) => handlers.get(e)!(ev, ctx),
   };
 }
@@ -69,6 +87,79 @@ function harness() {
   await h.emit("turn_end");
   assert.equal(h.compacts.length, 2, "auto-compact re-armed after a successful compaction");
   console.log("✓ onError: guard released, run resumed, no retry loop, re-armed on success");
+}
+
+// 2b. A failed compaction also lifts the force gate (else: no auto-compact AND every tool blocked)
+{
+  const h = harness();
+  await h.tools.get("self_compact").execute("c1", { note: "n" }, undefined, () => {}, h.ctx);
+  h.compacts[0].onError(new Error("boom"));
+  h.setPercent(95);
+  assert.equal(await h.emit("tool_call", { toolName: "bash" }), undefined, "gate must not deadlock after a failed compaction");
+  await h.emit("session_compact", { reason: "manual", willRetry: false });
+  assert.equal((await h.emit("tool_call", { toolName: "bash" }))?.block, true, "gate re-armed after a successful compaction");
+  console.log("✓ failed compaction lifts the force gate until a compaction succeeds");
+}
+
+// 2c. Cancellation is a stop boundary: no resume, no failure state
+{
+  const h = harness();
+  await h.tools.get("self_compact").execute("c1", { note: "n" }, undefined, () => {}, h.ctx);
+  await h.emit("session_compact_failed", { aborted: true, reason: "manual" });
+  h.compacts[0].onError(new Error("Compaction cancelled"));
+  assert.equal(h.sent.length, 0, "cancelled compaction must not resume");
+  h.setPercent(95);
+  assert.equal((await h.emit("tool_call", { toolName: "bash" }))?.block, true, "cancel is not a failure: gate stays");
+  console.log("✓ cancelled compaction: no resume");
+}
+
+// 2d. Session shutdown: late callbacks are no-ops even when the stale ctx throws
+{
+  const h = harness();
+  await h.tools.get("self_compact").execute("c1", { note: "n" }, undefined, () => {}, h.ctx);
+  await h.emit("session_shutdown");
+  Object.defineProperty(h.ctx, "ui", { get() { throw new Error("stale ctx"); } });
+  h.ctx.getContextUsage = () => { throw new Error("stale ctx"); };
+  h.compacts[0].onComplete({});
+  h.compacts[0].onError(new Error("x"));
+  assert.equal(h.sent.length, 0, "no resume after shutdown");
+  console.log("✓ shutdown: late onComplete/onError are safe no-ops");
+}
+
+// 2e. Loop bound: compaction that never restores headroom stops after 2 resumes
+{
+  const h = harness();
+  h.setPercent(85);
+  for (let i = 0; i < 5; i++) {
+    await h.emit("turn_end"); // still >= auto: compacts again
+    h.compacts.at(-1)?.onComplete({});
+  }
+  assert.equal(h.sent.filter((m) => m.options.triggerTurn).length, 2, "at most 2 consecutive compaction-driven resumes");
+  h.setPercent(30);
+  await h.emit("turn_end"); // headroom restored -> streak resets
+  h.setPercent(85);
+  await h.emit("turn_end");
+  h.compacts.at(-1).onComplete({});
+  assert.equal(h.sent.filter((m) => m.options.triggerTurn).length, 3, "streak resets after a turn with headroom");
+  // headroom check: known post-compaction usage still above auto -> no resume
+  const h2 = harness();
+  await h2.tools.get("self_compact").execute("c1", { note: "n" }, undefined, () => {}, h2.ctx);
+  h2.setUsage({ tokens: 90000, contextWindow: 100000, percent: 90 });
+  h2.compacts[0].onComplete({});
+  assert.equal(h2.sent.length, 0, "no resume when compaction did not free enough context");
+  console.log("✓ resume loop bounded (2), resets on headroom; no resume without headroom");
+}
+
+// 2f. Backups are per-workspace and the real home is never written
+{
+  const h = harness();
+  await h.tools.get("self_compact").execute("c1", { note: "repo A secret plan" }, undefined, () => {}, h.ctx);
+  const a = noteBackupPathFor("/work/repo-a"), b = noteBackupPathFor("/work/repo-b");
+  assert.notEqual(a, b);
+  assert.ok(a.startsWith(stateDir), "backup must honour PI_SELF_COMPACT_STATE_DIR");
+  assert.match(readFileSync(a, "utf8"), /cwd: "\/work\/repo-a"[\s\S]*repo A secret plan/);
+  assert.ok(!existsSync(b));
+  console.log("✓ note backup scoped per workspace with cwd header, sandboxed in tests");
 }
 
 // 3. turn_end: nudge once at 70–79% (model-visible steer), auto-compact at >=80%

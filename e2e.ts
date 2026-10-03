@@ -15,11 +15,11 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import selfCompact from "./index.ts";
 
 process.env.PI_SELF_COMPACT_JEV = "false";
-process.env.HOME = mkdtempSync(join(tmpdir(), "self-compact-e2e-")); // note backup lands in a throwaway dir
+process.env.PI_SELF_COMPACT_STATE_DIR = mkdtempSync(join(tmpdir(), "self-compact-e2e-")); // never the real backup
 
-async function run(name: string, reserveTokens: number, responses: any[], prompts: string | string[]) {
+async function run(name: string, reserveTokens: number, responses: any[], prompts: string | string[], onEvent?: (session: any, e: any) => void) {
   const faux = fauxProvider({ models: [{ id: "faux", contextWindow: 20000, maxTokens: 500 }] });
-  faux.setResponses(responses);
+  faux.setResponses(responses.map((r) => (typeof r === "function" ? r : () => ({ ...r, timestamp: Date.now() }))));
   const dir = mkdtempSync(join(tmpdir(), "pi-e2e-"));
   const modelRuntime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null });
   modelRuntime.registerNativeProvider(faux.provider);
@@ -38,6 +38,7 @@ async function run(name: string, reserveTokens: number, responses: any[], prompt
   await (session as any).bindExtensions?.({});
   const events: string[] = [];
   session.subscribe((e: any) => {
+    onEvent?.(session, e);
     if (["compaction_start", "compaction_end", "agent_settled"].includes(e.type)) { events.push(`${e.type}${e.reason ? ":" + e.reason : ""}`); if (e.type === "compaction_end" && process.env.E2E_DEBUG) console.log("  compaction_end", JSON.stringify({ aborted: e.aborted, err: e.errorMessage, hasResult: !!e.result })); }
   });
   for (const text of [prompts].flat()) await session.prompt(text);
@@ -87,4 +88,23 @@ assert.ok(b.roles.includes("compactionSummary"), "self_compact compaction must s
 assert.equal(b.pending, 0, "agent must resume after self_compact");
 assert.match(b.lastText, /RESUMED/);
 console.log("✓ B: self_compact tool resumes automatically with the note");
+// C: user cancels the self_compact compaction -> a cancel is a stop boundary, the agent must NOT resume
+const c = await run(
+  "cancelled",
+  1000,
+  [
+    fauxAssistantMessage("ack " + "z".repeat(3000)),
+    fauxAssistantMessage(fauxToolCall("self_compact", { note: "Goal: ship" }), { stopReason: "toolUse" }),
+    async () => { await new Promise((r) => setTimeout(r, 800)); return fauxAssistantMessage("## summary", { timestamp: Date.now() }); },
+    fauxAssistantMessage("SHOULD NOT RUN"),
+  ],
+  ["background " + "context ".repeat(800), "do the task"],
+  (session, ev) => { if (ev.type === "compaction_start") setTimeout(() => session.abortCompaction(), 100); },
+);
+await new Promise((r) => setTimeout(r, 1500)); // give any (wrong) resume time to happen
+assert.ok(c.events.includes("compaction_end:manual"), "compaction must have ended (cancelled)");
+assert.ok(!/SHOULD NOT RUN/.test(c.lastText), "cancelled compaction must not resume the agent");
+assert.ok(!c.roles.includes("custom:self_compact_continuation"), "no continuation message after a cancel");
+console.log("✓ C: cancelled compaction does not resume");
+
 console.log("\nE2E PASSED");

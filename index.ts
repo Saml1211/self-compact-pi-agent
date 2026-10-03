@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync, lstatSync } from "node:fs";
 import type {
   ExtensionAPI,
@@ -185,55 +186,90 @@ function usagePercent(ctx: ExtensionContext): number | null {
   return usage.percent ?? Math.round((usage.tokens / usage.contextWindow) * 100);
 }
 
+// Per-workspace backup so one repo's note is never replayed into another (pi-prime reads this
+// path too; keep both in sync). PI_SELF_COMPACT_STATE_DIR exists so tests never touch the real file.
+export function noteBackupPathFor(cwd: string, env: NodeJS.ProcessEnv = process.env): string {
+  const root = env.PI_SELF_COMPACT_STATE_DIR || join(homedir(), ".pi/state/continuation-notes");
+  return join(root, `${createHash("sha256").update(cwd).digest("hex").slice(0, 16)}.md`);
+}
+
+export function formatNoteBackup(cwd: string, note: string): string {
+  return `<!-- self-compact cwd: ${JSON.stringify(cwd)} saved: ${new Date().toISOString()} -->\n${note}\n`;
+}
+
+// ponytail: at most this many compaction-driven resumes in a row without a turn that ends below
+// the auto threshold. Stops compact -> resume -> compact loops when summaries are too big to help.
+const MAX_CONSECUTIVE_RESUMES = 2;
+
 export default function (pi: ExtensionAPI) {
   const config = resolveConfig();
   const jevApiKey = resolveJevApiKey();
-  const noteBackupPath = join(homedir(), ".pi/state/last-continuation-note.md");
 
   let compacting = false; // one of our own ctx.compact() calls is in flight
+  let cancelled = false; // the in-flight compaction was aborted (user/extension cancel): never resume
+  let disposed = false; // session shut down: callbacks must not touch the stale ctx
   let resumeAtSettle = false; // Pi's built-in compaction ran after the run ended
+  let resumeStreak = 0;
   let nudged = false; // nudge sent since the last compaction
-  // ponytail: after a failed auto-compact, stop auto-retrying until some compaction succeeds;
-  // otherwise every turn_end above the threshold would abort the run and fail again.
-  let autoCompactFailed = false;
-  let lastNote: string | null = null;
+  // After a failed compaction: no auto-retry and no force gate until some compaction succeeds;
+  // otherwise every turn_end would abort and fail again, or the gate would block all work.
+  let compactionFailed = false;
+
+  // Resume only when it can help: session alive, loop bound not hit, headroom actually restored.
+  function mayResume(ctx: ExtensionContext): boolean {
+    if (disposed) return false;
+    if (resumeStreak >= MAX_CONSECUTIVE_RESUMES) {
+      safeNotify(ctx, `[self-compact] Stopped auto-resume after ${resumeStreak} compactions in a row; context is not shrinking enough. Continue manually.`, "warning");
+      return false;
+    }
+    const after = safeUsage(ctx);
+    if (after !== null && after >= config.autoCompactPct) {
+      safeNotify(ctx, `[self-compact] Compaction left context at ${after}%; not auto-resuming.`, "warning");
+      return false;
+    }
+    resumeStreak++;
+    return true;
+  }
+
+  function resume(content: string) {
+    try {
+      pi.sendMessage({ customType: CONTINUATION_CUSTOM_TYPE, content, display: true }, { triggerTurn: true });
+    } catch {} // stale runtime after shutdown/session switch
+  }
 
   // ctx.compact() aborts the running agent (AgentSession.compact -> abort()), so the
-  // agent_before_settle boundary never fires for it. Resume from onComplete instead.
-  function startCompaction(ctx: ExtensionContext, note: string, resume: boolean, extra = ""): boolean {
-    if (compacting) return false;
+  // agent_before_settle boundary never fires for it. Resume from onComplete/onError instead.
+  function startCompaction(ctx: ExtensionContext, note: string, wantResume: boolean, extra = ""): boolean {
+    if (compacting || disposed) return false;
     compacting = true;
-    lastNote = note;
-    writeNoteBackupAtomic(noteBackupPath, note);
-    ctx.compact({
-      customInstructions: `Preserve these continuation notes verbatim under '## Critical Context':\n${note}\n${extra}`.trim(),
-      onComplete: () => {
-        compacting = false;
-        nudged = false;
-        if (resume) {
-          pi.sendMessage(
-            { customType: CONTINUATION_CUSTOM_TYPE, content: continuationContent(note), display: true },
-            { triggerTurn: true },
-          );
-        }
-      },
-      onError: (error) => {
-        compacting = false;
-        autoCompactFailed = true;
-        ctx.ui?.notify?.(`[self-compact] Compaction failed: ${error.message}`, "error");
-        // compact() already aborted the run; resume anyway so a failed compaction never strands the agent.
-        if (resume) {
-          pi.sendMessage(
-            {
-              customType: CONTINUATION_CUSTOM_TYPE,
-              content: `[self-compact] Compaction failed (${error.message}); context was NOT reduced. Continue the active task.`,
-              display: true,
-            },
-            { triggerTurn: true },
-          );
-        }
-      },
-    });
+    cancelled = false;
+    const cwd = ctx.cwd || process.cwd();
+    writeNoteBackupAtomic(noteBackupPathFor(cwd), formatNoteBackup(cwd, note));
+    try {
+      ctx.compact({
+        customInstructions: `Preserve these continuation notes verbatim under '## Critical Context':\n${note}\n${extra}`.trim(),
+        onComplete: () => {
+          compacting = false;
+          nudged = false;
+          if (wantResume && mayResume(ctx)) resume(continuationContent(note));
+        },
+        onError: (error) => {
+          compacting = false;
+          if (disposed) return;
+          if (cancelled) return; // a cancel is a stop boundary, not a failure to recover from
+          compactionFailed = true;
+          safeNotify(ctx, `[self-compact] Compaction failed: ${error.message}`, "error");
+          // compact() already aborted the run; resume so a failed compaction never strands the agent.
+          if (wantResume && !disposed && resumeStreak < MAX_CONSECUTIVE_RESUMES) {
+            resumeStreak++;
+            resume(`[self-compact] Compaction failed (${error.message}); context was NOT reduced. Continue the active task; auto-compaction and the tool gate are paused until a compaction succeeds.`);
+          }
+        },
+      });
+    } catch {
+      compacting = false;
+      return false;
+    }
     return true;
   }
 
@@ -270,6 +306,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      resumeStreak = 0; // a deliberate model decision, not a loop
       startCompaction(ctx, note, true, params.customInstructions ?? "");
       return {
         content: [
@@ -286,16 +323,17 @@ export default function (pi: ExtensionAPI) {
     description: "Compact now, preserving optional continuation notes; resumes the agent if it was working",
     handler: async (args, ctx) => {
       const note = args?.trim().slice(0, 60000) || "Manual user-requested compaction.";
+      resumeStreak = 0;
       // Only resume a run the user interrupted; an idle session stays idle.
       if (!startCompaction(ctx, note, ctx.isIdle?.() === false)) {
-        ctx.ui?.notify?.("[self-compact] A compaction is already in progress.", "warning");
+        safeNotify(ctx, "[self-compact] A compaction is already in progress.", "warning");
       }
     },
   });
 
   pi.on("tool_call", async (event, ctx: ExtensionContext) => {
-    if (isSubagent()) return;
-    const percent = usagePercent(ctx);
+    if (isSubagent() || compactionFailed) return;
+    const percent = safeUsage(ctx);
     if (percent === null || percent < config.forcePct) return;
     if (event.toolName === "self_compact" || event.toolName === "yield_control") return;
     return {
@@ -308,46 +346,71 @@ export default function (pi: ExtensionAPI) {
     // A turn finished after a built-in compaction, so the agent is already running again.
     resumeAtSettle = false;
     if (isSubagent() || compacting) return;
-    const percent = usagePercent(ctx);
+    const percent = safeUsage(ctx);
     if (percent === null) return;
+    if (percent < config.autoCompactPct) resumeStreak = 0; // real progress with headroom
 
-    if (percent >= config.autoCompactPct && !autoCompactFailed) {
-      ctx.ui?.notify?.(`[self-compact] Auto-compacting at ${percent}% context usage.`, "warning");
+    if (percent >= config.autoCompactPct && !compactionFailed) {
+      safeNotify(ctx, `[self-compact] Auto-compacting at ${percent}% context usage.`, "warning");
       startCompaction(
         ctx,
         `Autonomous self-compaction at ${percent}% context usage; the model did not call self_compact. Reconstruct the active task from the summary.`,
         true,
       );
-    } else if (percent >= config.nudgePct && !nudged) {
+    } else if (percent >= config.nudgePct && percent < config.autoCompactPct && !nudged) {
       nudged = true;
       // Steer reaches the model's next request; a ui.notify toast never does.
-      pi.sendMessage(
-        {
-          customType: "self_compact_nudge",
-          content: `[self-compact] Context is at ${percent}%. At the next natural boundary, call self_compact with structured continuation notes (goal, done, in progress, decisions, next steps). Auto-compaction with a generic note happens at ${config.autoCompactPct}%.`,
-          display: true,
-        },
-        { deliverAs: "steer" },
-      );
+      try {
+        pi.sendMessage(
+          {
+            customType: "self_compact_nudge",
+            content: `[self-compact] Context is at ${percent}%. At the next natural boundary, call self_compact with structured continuation notes (goal, done, in progress, decisions, next steps). Auto-compaction with a generic note happens at ${config.autoCompactPct}%.`,
+            display: true,
+          },
+          { deliverAs: "steer" },
+        );
+      } catch {}
     }
+  });
+
+  pi.on("session_compact_failed", async (event: any) => {
+    if (compacting && event?.aborted) cancelled = true; // emitted before onError
   });
 
   pi.on("session_compact", async (event) => {
     nudged = false;
-    autoCompactFailed = false;
+    compactionFailed = false;
     // Built-in threshold compaction after agent_end leaves nothing queued, so Pi settles and waits
     // for the user. Overflow recovery with willRetry already continues; manual compactions are ours or the user's.
     if (!compacting && event.reason === "threshold" && !event.willRetry) resumeAtSettle = true;
   });
 
-  pi.on("agent_before_settle", async () => {
+  pi.on("agent_before_settle", async (_event, ctx: ExtensionContext) => {
     if (!resumeAtSettle) return;
     resumeAtSettle = false;
-    const note = lastNote;
-    lastNote = null;
+    if (!mayResume(ctx)) return;
     return {
       continue: true,
-      entries: [{ type: "custom_message", customType: CONTINUATION_CUSTOM_TYPE, content: continuationContent(note), display: true }],
+      entries: [{ type: "custom_message", customType: CONTINUATION_CUSTOM_TYPE, content: continuationContent(null), display: true }],
     };
   });
+
+  pi.on("session_shutdown", async () => {
+    disposed = true;
+    resumeAtSettle = false;
+  });
+}
+
+function safeNotify(ctx: ExtensionContext, msg: string, level: "info" | "warning" | "error") {
+  try {
+    ctx.ui?.notify?.(msg, level);
+  } catch {} // ctx is invalidated after shutdown and throws on access
+}
+
+function safeUsage(ctx: ExtensionContext): number | null {
+  try {
+    return usagePercent(ctx);
+  } catch {
+    return null;
+  }
 }
