@@ -71,7 +71,8 @@ assert.match(a.lastText, /RESUMED/);
 assert.ok(a.roles.includes("custom:self_compact_continuation"), "continuation message must be in context");
 console.log("✓ A: built-in threshold compaction resumes without a human 'continue'");
 
-// B: model calls self_compact; Pi's compact() aborts the run, extension resumes via onComplete
+// B: model calls self_compact; the tool ends the turn (terminate, no extra model request), the
+// compaction starts once the run has settled, and the extension resumes via onComplete
 const b = await run(
   "self_compact-tool",
   1000, // built-in threshold out of the way
@@ -132,5 +133,25 @@ delete process.env.TYPESAFE_API_KEY;
 assert.ok(!dRun.events.some((x) => x.startsWith("compaction_start")), "stopped during audit: no compaction");
 assert.ok(!/SHOULD NOT RUN/.test(dRun.lastText), "stopped during audit: no resume");
 console.log("✓ D: stop during the Jev audit neither compacts nor resumes");
+
+// E: user stops right after the self_compact tool returns (before Pi could start any compaction).
+// The old design compacted and resumed anyway; Pi skips agent_before_settle on a stop, so now nothing runs.
+const eRun = await run(
+  "stop-after-tool",
+  1000,
+  [
+    fauxAssistantMessage("ack " + "z".repeat(3000)),
+    fauxAssistantMessage(fauxToolCall("self_compact", { note: "Goal: ship" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("## summary"),
+    fauxAssistantMessage("SHOULD NOT RUN"),
+  ],
+  ["background " + "context ".repeat(800), "do the task"],
+  (session, ev) => { if (ev.type === "tool_execution_end" && ev.toolName === "self_compact") void session.abort(); },
+);
+await new Promise((r) => setTimeout(r, 1500));
+assert.ok(!eRun.events.some((x) => x.startsWith("compaction_start")), "stopped after the tool: no compaction");
+assert.ok(!/SHOULD NOT RUN/.test(eRun.lastText), "stopped after the tool: no resume");
+assert.equal(eRun.pending, 2, "neither the summary nor the resume response was requested");
+console.log("✓ E: stop right after self_compact returns neither compacts nor resumes");
 
 console.log("\nE2E PASSED");

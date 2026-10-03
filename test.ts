@@ -49,17 +49,24 @@ function harness() {
     setIdle: (v: boolean) => (idle = v),
     setUsage: (u: any) => (usageOverride = u),
     emit: (e: string, ev: any = {}) => handlers.get(e)!(ev, ctx),
+    // a run that ends normally: Pi runs agent_before_settle, then agent_settled
+    settle: async () => { await handlers.get("agent_before_settle")!({}, ctx); await handlers.get("agent_settled")!({}, ctx); },
   };
 }
 
-// 1. self_compact tool: compacts once, resumes via sendMessage(triggerTurn) carrying the note
+// 1. self_compact tool: schedules, ends the turn (terminate), compacts once settled, resumes with the note
 {
   const h = harness();
-  await h.tools.get("self_compact").execute("c1", { note: "Goal: X\nNext: Y" }, new AbortController().signal, () => {}, h.ctx);
+  const r = await h.tools.get("self_compact").execute("c1", { note: "Goal: X\nNext: Y" }, new AbortController().signal, () => {}, h.ctx);
+  assert.equal(r.terminate, true, "the tool ends the turn instead of aborting it");
+  assert.equal(h.compacts.length, 0, "nothing compacts while the run is still going");
+  assert.equal((await h.emit("tool_call", { toolName: "bash" }))?.terminate, true, "other calls in the run end the turn");
+  await h.settle();
   assert.equal(h.compacts.length, 1);
   assert.match(h.compacts[0].customInstructions, /Goal: X/);
-  // overlap guard: second call while in flight does not compact again
+  // overlap guard: a call while compacting does not schedule another
   await h.tools.get("self_compact").execute("c2", { note: "again" }, undefined, () => {}, h.ctx);
+  await h.settle();
   assert.equal(h.compacts.length, 1, "overlapping compaction must be refused");
   await h.emit("session_compact", { reason: "manual", willRetry: false });
   h.compacts[0].onComplete({});
@@ -69,30 +76,47 @@ function harness() {
   assert.match(h.sent[0].message.content, /Goal: X/, "note must be delivered to the model");
   assert.equal(await h.emit("agent_before_settle"), undefined, "own compaction must not also resume at settle");
   await assert.rejects(h.tools.get("self_compact").execute("c3", { note: "   " }, undefined, () => {}, h.ctx));
-  console.log("✓ tool: compact → onComplete → triggerTurn resume with note; overlap + empty note refused");
+  console.log("✓ tool: schedule + terminate → compact when settled → triggerTurn resume with note; overlap + empty note refused");
 }
 
-// 2. onError releases the guard, still resumes (compact() already aborted the run), and stops auto-retry loops
+// 1b. User stop: Pi skips agent_before_settle when an abort was requested -> no compaction, no resume
 {
   const h = harness();
   await h.tools.get("self_compact").execute("c1", { note: "n" }, undefined, () => {}, h.ctx);
+  await h.emit("agent_settled"); // stopped run: settled without before_settle
+  assert.equal(h.compacts.length, 0, "a stopped run must not compact");
+  assert.equal(h.sent.length, 0, "a stopped run must not resume");
+  await h.settle();
+  assert.equal(h.compacts.length, 0, "the dropped compaction does not come back later");
+  assert.equal(await h.emit("tool_call", { toolName: "bash" }), undefined, "nothing left blocking tools");
+  console.log("✓ user stop before the run settles: compaction dropped, no resume");
+}
+
+// 2. onError releases the guard, still resumes (the run stopped for it), and stops auto-retry loops
+{
+  const h = harness();
+  await h.tools.get("self_compact").execute("c1", { note: "n" }, undefined, () => {}, h.ctx);
+  await h.settle();
   h.compacts[0].onError(new Error("boom"));
   assert.equal(h.sent.length, 1);
-  assert.equal(h.sent[0].options.triggerTurn, true, "failed compaction must still resume the aborted run");
+  assert.equal(h.sent[0].options.triggerTurn, true, "failed compaction must still resume the run");
   assert.match(h.sent[0].message.content, /NOT reduced/);
   h.setPercent(85);
   await h.emit("turn_end");
+  await h.settle();
   assert.equal(h.compacts.length, 1, "no auto-compact retry loop after a failure");
   await h.emit("session_compact", { reason: "manual", willRetry: false });
   await h.emit("turn_end");
+  await h.settle();
   assert.equal(h.compacts.length, 2, "auto-compact re-armed after a successful compaction");
   console.log("✓ onError: guard released, run resumed, no retry loop, re-armed on success");
 }
 
-// 2b. A failed compaction also lifts the force gate (else: no auto-compact AND every tool blocked)
+// 2b. A failed compaction also lifts the force gate (else: every tool call would end the turn)
 {
   const h = harness();
   await h.tools.get("self_compact").execute("c1", { note: "n" }, undefined, () => {}, h.ctx);
+  await h.settle();
   h.compacts[0].onError(new Error("boom"));
   h.setPercent(95);
   assert.equal(await h.emit("tool_call", { toolName: "bash" }), undefined, "gate must not deadlock after a failed compaction");
@@ -105,6 +129,7 @@ function harness() {
 {
   const h = harness();
   await h.tools.get("self_compact").execute("c1", { note: "n" }, undefined, () => {}, h.ctx);
+  await h.settle();
   await h.emit("session_compact_failed", { aborted: true, reason: "manual" });
   h.compacts[0].onError(new Error("Compaction cancelled"));
   assert.equal(h.sent.length, 0, "cancelled compaction must not resume");
@@ -113,16 +138,20 @@ function harness() {
   console.log("✓ cancelled compaction: no resume");
 }
 
-// 2d. Session shutdown: late callbacks are no-ops even when the stale ctx throws
+// 2d. Session shutdown: late callbacks are no-ops even when the stale ctx throws; nothing scheduled survives
 {
   const h = harness();
   await h.tools.get("self_compact").execute("c1", { note: "n" }, undefined, () => {}, h.ctx);
+  await h.settle();
+  await h.tools.get("self_compact").execute("c2", { note: "n2" }, undefined, () => {}, h.ctx); // refused: compacting
   await h.emit("session_shutdown");
   Object.defineProperty(h.ctx, "ui", { get() { throw new Error("stale ctx"); } });
   h.ctx.getContextUsage = () => { throw new Error("stale ctx"); };
   h.compacts[0].onComplete({});
   h.compacts[0].onError(new Error("x"));
+  await h.settle();
   assert.equal(h.sent.length, 0, "no resume after shutdown");
+  assert.equal(h.compacts.length, 1, "no compaction after shutdown");
   console.log("✓ shutdown: late onComplete/onError are safe no-ops");
 }
 
@@ -130,20 +159,24 @@ function harness() {
 {
   const h = harness();
   h.setPercent(85);
+  const resumes = () => h.sent.filter((m) => m.options.triggerTurn).length;
   for (let i = 0; i < 5; i++) {
-    await h.emit("turn_end"); // still >= auto: compacts again
+    await h.emit("turn_end"); // still >= auto: schedules again
+    await h.settle();
     h.compacts.at(-1)?.onComplete({});
   }
-  assert.equal(h.sent.filter((m) => m.options.triggerTurn).length, 2, "at most 2 consecutive compaction-driven resumes");
+  assert.equal(resumes(), 2, "at most 2 consecutive compaction-driven resumes");
   h.setPercent(30);
   await h.emit("turn_end"); // headroom restored -> streak resets
   h.setPercent(85);
   await h.emit("turn_end");
+  await h.settle();
   h.compacts.at(-1).onComplete({});
-  assert.equal(h.sent.filter((m) => m.options.triggerTurn).length, 3, "streak resets after a turn with headroom");
+  assert.equal(resumes(), 3, "streak resets after a turn with headroom");
   // headroom check: known post-compaction usage still above auto -> no resume
   const h2 = harness();
   await h2.tools.get("self_compact").execute("c1", { note: "n" }, undefined, () => {}, h2.ctx);
+  await h2.settle();
   h2.setUsage({ tokens: 90000, contextWindow: 100000, percent: 90 });
   h2.compacts[0].onComplete({});
   assert.equal(h2.sent.length, 0, "no resume when compaction did not free enough context");
@@ -155,19 +188,21 @@ function harness() {
   const h = harness();
   for (let i = 0; i < 5; i++) {
     await h.tools.get("self_compact").execute("c" + i, { note: "n" + i }, undefined, () => {}, h.ctx);
-    await h.emit("turn_end"); // the tool-call turn ends while compacting: no streak reset
+    await h.emit("turn_end"); // the tool-call turn ends with a compaction scheduled: no streak reset
+    await h.settle();
     h.compacts.at(-1).onComplete({});
   }
   assert.equal(h.sent.filter((m) => m.options.triggerTurn).length, 2, "model-driven compactions bounded at 2 resumes");
   console.log("✓ repeated self_compact calls bounded at 2 resumes");
 }
 
-// 2h. Aborted tool (before or during the audit) neither compacts nor resumes
+// 2h. Aborted tool (before or during the audit) neither schedules nor compacts
 {
   const h = harness();
   const ac = new AbortController();
   ac.abort();
   const r = await h.tools.get("self_compact").execute("c1", { note: "n" }, ac.signal, () => {}, h.ctx);
+  await h.settle();
   assert.equal(h.compacts.length, 0, "aborted before audit: no compaction");
   assert.match(r.content[0].text, /Aborted/);
   console.log("✓ aborted tool: no compaction");
@@ -177,6 +212,7 @@ function harness() {
 {
   const h = harness();
   await h.tools.get("self_compact").execute("c1", { note: "repo A secret plan" }, undefined, () => {}, h.ctx);
+  await h.settle();
   const a = noteBackupPathFor("/work/repo-a"), b = noteBackupPathFor("/work/repo-b");
   assert.notEqual(a, b);
   assert.ok(a.startsWith(stateDir), "backup must honour PI_SELF_COMPACT_STATE_DIR");
@@ -185,7 +221,7 @@ function harness() {
   console.log("✓ note backup scoped per workspace with cwd header, sandboxed in tests");
 }
 
-// 3. turn_end: nudge once at 70–79% (model-visible steer), auto-compact at >=80%
+// 3. turn_end: nudge once at 70–79%; at >=80% ask for notes once, then any other tool ends the turn
 {
   const h = harness();
   h.setPercent(75);
@@ -193,14 +229,28 @@ function harness() {
   await h.emit("turn_end");
   assert.equal(h.sent.length, 1, "nudge exactly once");
   assert.equal(h.sent[0].options.deliverAs, "steer");
-  assert.equal(h.compacts.length, 0);
   h.setPercent(82);
   await h.emit("turn_end");
   await h.emit("turn_end");
-  assert.equal(h.compacts.length, 1, "auto-compact once while in flight");
+  assert.equal(h.sent.length, 2, "one auto-compact steer, not repeated");
+  assert.match(h.sent[1].message.content, /Call self_compact NOW/);
+  assert.equal(h.compacts.length, 0, "never compacts mid-run");
+  const blocked = await h.emit("tool_call", { toolName: "bash" });
+  assert.equal(blocked?.block, true);
+  assert.equal(blocked?.terminate, true, "ignoring the request ends the turn");
+  await h.settle();
+  assert.equal(h.compacts.length, 1);
+  assert.match(h.compacts[0].customInstructions, /Autonomous self-compaction at 82%/);
   h.compacts[0].onComplete({});
   assert.equal(h.sent.at(-1)!.options.triggerTurn, true);
-  console.log("✓ turn_end: single steer nudge, single auto-compact, resumes");
+  // the model answering the request with its own notes replaces the generic note
+  const h2 = harness();
+  h2.setPercent(82);
+  await h2.emit("turn_end");
+  await h2.tools.get("self_compact").execute("c1", { note: "Goal: model-written" }, undefined, () => {}, h2.ctx);
+  await h2.settle();
+  assert.match(h2.compacts[0].customInstructions, /model-written/);
+  console.log("✓ turn_end: steer nudge once; at 80% the model gets one chance to write notes, else generic; never mid-run");
 }
 
 // 4. Pi built-in threshold compaction after agent_end → resume at settle exactly once
@@ -211,7 +261,15 @@ function harness() {
   assert.equal(r.continue, true);
   assert.equal(r.entries[0].type, "custom_message");
   assert.equal(await h.emit("agent_before_settle"), undefined, "resume once only");
-  console.log("✓ built-in post-run compaction resumes at agent_before_settle");
+  // Pi's own compaction supersedes a scheduled one, and the resume carries the model's note
+  const h2 = harness();
+  await h2.tools.get("self_compact").execute("c1", { note: "Goal: carried" }, undefined, () => {}, h2.ctx);
+  await h2.emit("session_compact", { reason: "threshold", willRetry: false });
+  const r2 = await h2.emit("agent_before_settle");
+  await h2.emit("agent_settled");
+  assert.equal(h2.compacts.length, 0, "no second compaction after Pi's own");
+  assert.match(r2.entries[0].content, /Goal: carried/);
+  console.log("✓ built-in post-run compaction resumes at agent_before_settle (and supersedes a scheduled one)");
 }
 
 // 5. Cases that must NOT resume
@@ -236,8 +294,16 @@ function harness() {
 {
   const h = harness();
   h.setPercent(90);
-  assert.equal((await h.emit("tool_call", { toolName: "bash" }))?.block, true);
+  const g = await h.emit("tool_call", { toolName: "bash" });
+  assert.equal(g?.block, true);
+  assert.equal(g?.terminate, true, "force gate ends the turn and schedules a compaction");
   assert.equal(await h.emit("tool_call", { toolName: "self_compact" }), undefined);
+  await h.settle();
+  assert.equal(h.compacts.length, 1);
+  h.setPercent(82);
+  const h2 = harness();
+  h2.setPercent(82);
+  assert.equal(await h2.emit("tool_call", { toolName: "bash" }), undefined, "below force: tool calls run");
   assert.deepEqual(resolveConfig({ PI_SELF_COMPACT_AUTO_PCT: "95" } as any), { ...DEFAULT_CONFIG }, "misordered → defaults");
   assert.equal(resolveConfig({ PI_SELF_COMPACT_AUTO_PCT: "85", PI_SELF_COMPACT_FORCE_PCT: "90" } as any).autoCompactPct, 85);
   console.log("✓ force gate + threshold ordering");

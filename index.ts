@@ -14,7 +14,7 @@ import { Type } from "@sinclair/typebox";
 export interface SelfCompactConfig {
   nudgePct: number; // model-visible steer message asking for self_compact
   autoCompactPct: number; // compact autonomously with a generic note if the model ignored the nudge
-  forcePct: number; // block every tool except self_compact / yield_control
+  forcePct: number; // stop the run immediately (block + terminate) and compact with a generic note
   jevEnabled: boolean; // audit continuation notes with TypeSafe Jev
 }
 
@@ -206,9 +206,16 @@ export default function (pi: ExtensionAPI) {
   const jevApiKey = resolveJevApiKey();
 
   let compacting = false; // one of our own ctx.compact() calls is in flight
+  // Our compactions never abort a running agent. They are scheduled (pending), the turn ends cleanly
+  // (tool result / blocked call with terminate), and they start once the run has settled. Pi skips
+  // agent_before_settle when anyone requested an abort, so "armed" there means the user did not stop;
+  // a stopped run drops the pending compaction instead of compacting and resuming against the stop.
+  let pending: { note: string; extra: string } | null = null;
+  let armed = false;
   let cancelled = false; // the in-flight compaction was aborted (user/extension cancel): never resume
   let disposed = false; // session shut down: callbacks must not touch the stale ctx
   let resumeAtSettle = false; // Pi's built-in compaction ran after the run ended
+  let supersededNote: string | null = null; // a scheduled note Pi's own compaction overtook
   let resumeStreak = 0;
   let nudged = false; // nudge sent since the last compaction
   // After a failed compaction: no auto-retry and no force gate until some compaction succeeds;
@@ -231,14 +238,28 @@ export default function (pi: ExtensionAPI) {
     return true;
   }
 
+  function schedule(ctx: ExtensionContext, note: string, extra = "", steer?: string) {
+    pending = { note, extra };
+    armed = false;
+    if (steer) {
+      try {
+        pi.sendMessage({ customType: "self_compact_nudge", content: steer, display: true }, { deliverAs: "steer" });
+      } catch {}
+    }
+  }
+
+  function genericNote(percent: number) {
+    return `Autonomous self-compaction at ${percent}% context usage; the model did not call self_compact. Reconstruct the active task from the summary.`;
+  }
+
   function resume(content: string) {
     try {
       pi.sendMessage({ customType: CONTINUATION_CUSTOM_TYPE, content, display: true }, { triggerTurn: true });
     } catch {} // stale runtime after shutdown/session switch
   }
 
-  // ctx.compact() aborts the running agent (AgentSession.compact -> abort()), so the
-  // agent_before_settle boundary never fires for it. Resume from onComplete/onError instead.
+  // Only ever called on a settled run (agent_settled) or by the user's /self-compact, so the
+  // abort() inside AgentSession.compact() never cuts work short. Resume from onComplete/onError.
   function startCompaction(ctx: ExtensionContext, note: string, wantResume: boolean, extra = ""): boolean {
     if (compacting || disposed) return false;
     compacting = true;
@@ -259,7 +280,7 @@ export default function (pi: ExtensionAPI) {
           if (cancelled) return; // a cancel is a stop boundary, not a failure to recover from
           compactionFailed = true;
           safeNotify(ctx, `[self-compact] Compaction failed: ${error.message}`, "error");
-          // compact() already aborted the run; resume so a failed compaction never strands the agent.
+          // The run stopped for this compaction; resume so a failed compaction never strands the agent.
           if (wantResume && !disposed && resumeStreak < MAX_CONSECUTIVE_RESUMES) {
             resumeStreak++;
             resume(`[self-compact] Compaction failed (${error.message}); context was NOT reduced. Continue the active task; auto-compaction and the tool gate are paused until a compaction succeeds.`);
@@ -313,14 +334,16 @@ export default function (pi: ExtensionAPI) {
 
       // No resumeStreak reset here: repeated model calls must not bypass the resume bound.
       // It resets only on measured headroom (turn_end) or an explicit /self-compact.
-      startCompaction(ctx, note, true, params.customInstructions ?? "");
+      schedule(ctx, note, params.customInstructions ?? "");
       return {
         content: [
           {
             type: "text",
-            text: `[self-compact] Compaction started. The agent resumes automatically with your note (${note.length} chars).${jevReport}`,
+            text: `[self-compact] Compaction scheduled: this turn ends now, context is compacted, and the agent resumes with your note (${note.length} chars).${jevReport}`,
           },
         ],
+        details: undefined,
+        terminate: true, // end the turn without another model request; compaction starts once settled
       };
     },
   });
@@ -330,6 +353,8 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const note = args?.trim().slice(0, 60000) || "Manual user-requested compaction.";
       resumeStreak = 0;
+      pending = null; // the user's compaction replaces any scheduled one
+      armed = false;
       // Only resume a run the user interrupted; an idle session stays idle.
       if (!startCompaction(ctx, note, ctx.isIdle?.() === false)) {
         safeNotify(ctx, "[self-compact] A compaction is already in progress.", "warning");
@@ -337,31 +362,46 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // A scheduled compaction ends the turn: other tool calls are blocked with terminate, so the loop
+  // stops after this batch without an abort. At forcePct the run stops even with nothing scheduled.
   pi.on("tool_call", async (event, ctx: ExtensionContext) => {
+    if (event.toolName === "self_compact" || event.toolName === "yield_control") return;
+    if (pending) {
+      return {
+        block: true,
+        terminate: true,
+        reason: "[self-compact] A compaction is scheduled, so this turn is ending; the agent resumes automatically afterwards. Redo this call then if it is still needed.",
+      };
+    }
     if (isSubagent() || compactionFailed) return;
     const percent = safeUsage(ctx);
     if (percent === null || percent < config.forcePct) return;
-    if (event.toolName === "self_compact" || event.toolName === "yield_control") return;
+    schedule(ctx, genericNote(percent));
+    safeNotify(ctx, `[self-compact] Context at ${percent}%: stopping this turn to compact.`, "warning");
     return {
       block: true,
-      reason: `[self-compact: FORCE GATE] Context usage is ${percent}% (threshold ${config.forcePct}%). Call 'self_compact' with continuation notes before any other tool.`,
+      terminate: true,
+      reason: `[self-compact: FORCE GATE] Context usage is ${percent}% (threshold ${config.forcePct}%). This turn is ending to compact; the agent resumes automatically afterwards.`,
     };
   });
 
   pi.on("turn_end", async (_event, ctx: ExtensionContext) => {
     // A turn finished after a built-in compaction, so the agent is already running again.
     resumeAtSettle = false;
-    if (isSubagent() || compacting) return;
+    supersededNote = null;
+    if (isSubagent() || compacting || pending) return;
     const percent = safeUsage(ctx);
     if (percent === null) return;
     if (percent < config.autoCompactPct) resumeStreak = 0; // real progress with headroom
 
     if (percent >= config.autoCompactPct && !compactionFailed) {
-      safeNotify(ctx, `[self-compact] Auto-compacting at ${percent}% context usage.`, "warning");
-      startCompaction(
+      // Give the model one chance to write its own notes; any other tool call ends the turn (tool_call).
+      safeNotify(ctx, `[self-compact] Context at ${percent}%: compacting at the end of this turn.`, "warning");
+      schedule(
         ctx,
-        `Autonomous self-compaction at ${percent}% context usage; the model did not call self_compact. Reconstruct the active task from the summary.`,
-        true,
+        genericNote(percent),
+        "",
+        `[self-compact] Context is at ${percent}%. Call self_compact NOW with structured continuation notes (goal, done, in progress, decisions, next steps). Any other tool call ends this turn and compacts with a generic note.`,
       );
     } else if (percent >= config.nudgePct && percent < config.autoCompactPct && !nudged) {
       nudged = true;
@@ -386,24 +426,50 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_compact", async (event) => {
     nudged = false;
     compactionFailed = false;
+    const superseded = !compacting ? pending : null; // Pi compacted on its own: ours is redundant
+    if (superseded) {
+      pending = null;
+      armed = false;
+      supersededNote = superseded.note;
+    }
     // Built-in threshold compaction after agent_end leaves nothing queued, so Pi settles and waits
     // for the user. Overflow recovery with willRetry already continues; manual compactions are ours or the user's.
     if (!compacting && event.reason === "threshold" && !event.willRetry) resumeAtSettle = true;
   });
 
   pi.on("agent_before_settle", async (_event, ctx: ExtensionContext) => {
+    if (pending) armed = true; // Pi only gets here when no abort was requested
     if (!resumeAtSettle) return;
     resumeAtSettle = false;
+    const note = supersededNote;
+    supersededNote = null;
     if (!mayResume(ctx)) return;
     return {
       continue: true,
-      entries: [{ type: "custom_message", customType: CONTINUATION_CUSTOM_TYPE, content: continuationContent(null), display: true }],
+      entries: [{ type: "custom_message", customType: CONTINUATION_CUSTOM_TYPE, content: continuationContent(note), display: true }],
     };
+  });
+
+  pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
+    const job = pending;
+    const go = armed;
+    pending = null;
+    armed = false;
+    if (!job || disposed) return;
+    // ponytail: a stop pressed after agent_before_settle but before this event (other extensions'
+    // settle handlers) is invisible to extensions in Pi 1.0.0; the compaction itself can still be cancelled.
+    if (!go) {
+      safeNotify(ctx, "[self-compact] The run was stopped, so the scheduled compaction was skipped.", "info");
+      return;
+    }
+    startCompaction(ctx, job.note, true, job.extra);
   });
 
   pi.on("session_shutdown", async () => {
     disposed = true;
     resumeAtSettle = false;
+    pending = null;
+    armed = false;
   });
 }
 

@@ -7,17 +7,21 @@ Context lifecycle management for the [Pi coding agent](https://github.com/earend
 | Context usage | Action |
 | --- | --- |
 | 70% | Steer message to the model (it sees this, unlike a UI toast): call `self_compact` at the next boundary |
-| 80% | Auto-compacts with a generic note if the model ignored the nudge |
-| 88% | Blocks every tool except `self_compact` / `yield_control` |
+| 80% | Asks the model to call `self_compact` now. Any other tool call ends the turn, and the compaction uses a generic note |
+| 88% | Ends the turn at the next tool call and compacts with a generic note |
 
 Pi's built-in auto-compaction fires at `contextWindow - reserveTokens` (default 16384), about 92% on 200K, 94% on 272K and 98% on 1M, so every stage above happens first.
 
 **Auto-resume.** Two compaction paths used to leave the agent idle:
 
-1. **`ctx.compact()`**, which the `self_compact` tool, `/self-compact` and the 80% trigger all use, aborts the running agent. The extension resumes it from `onComplete` with `pi.sendMessage(..., { triggerTurn: true })`, carrying the note. A failed compaction also resumes, and the 80% trigger stops retrying until some compaction succeeds.
+1. **`ctx.compact()` aborts the running agent**, so the extension never calls it mid-run. The `self_compact` tool and the 80%/88% triggers *schedule* a compaction and end the turn cleanly. The tool returns `terminate: true`, and other tool calls are blocked with `terminate`, so no extra model request is made. Compaction starts on `agent_settled`, once the run is over. The extension then resumes from `onComplete` with `pi.sendMessage(..., { triggerTurn: true })`, carrying the note. A failed compaction also resumes, and the auto trigger stops retrying until some compaction succeeds.
 2. **Pi's built-in threshold compaction** after a run ends leaves nothing queued, so Pi settles. The extension's `agent_before_settle` hook returns `continue: true` with a continuation message.
 
-Auto-resume is bounded: at most 2 compaction-driven resumes in a row without a turn that ends below the auto threshold, and none when the compaction left usage above that threshold. A **cancelled** compaction never resumes, and nothing fires after `session_shutdown`. After a failed compaction, both the auto trigger and the force gate pause until some compaction succeeds, so a failure can't deadlock the agent.
+Auto-resume is bounded: at most 2 compaction-driven resumes in a row without a turn that ends below the auto threshold, and none when the compaction left usage above that threshold. **Stopping wins.** Pi skips `agent_before_settle` whenever an abort was requested, and that hook is what arms a scheduled compaction. If you stop the agent after `self_compact` returns, the scheduled compaction is dropped: no compaction and no resume. A **cancelled** compaction never resumes either, and nothing fires after `session_shutdown`.
+
+One window remains, and Pi 1.0.0 gives extensions no way to see it: a stop pressed after `agent_before_settle` but before `agent_settled`. That is only as long as the other extensions' settle handlers take. Pressing Esc while the compaction runs still cancels it.
+
+`/self-compact` is yours, so it compacts immediately, and it resumes only a run it interrupted. After a failed compaction, both the auto trigger and the force gate pause until some compaction succeeds, so a failure can't deadlock the agent.
 
 It does not resume after overflow recovery (Pi already retries), after a plain `/compact` you ran yourself, after `/self-compact` on an idle session, or after a compaction in the middle of a run (the agent is still working).
 
@@ -34,7 +38,7 @@ It does not resume after overflow recovery (Pi already retries), after a plain `
 
 ```bash
 bun run test.ts   # unit: event ordering, guards, no-resume cases
-bun run e2e.ts    # real Pi AgentSession + faux provider: both resume paths; cancel and stop-during-audit = no resume; no network
+bun run e2e.ts    # real Pi AgentSession + faux provider: both resume paths; cancel, stop-during-audit and stop-after-tool = no resume; no network
 ```
 
 Both need Pi's packages resolvable, for example `NODE_PATH=$(npm root -g):$(npm root -g)/@earendil-works/pi-coding-agent/node_modules`.
