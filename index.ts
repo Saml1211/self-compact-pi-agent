@@ -1,28 +1,18 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync, lstatSync } from "node:fs";
 import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
-// ponytail: minimal Typesafe Jev client inline to ensure zero dependency hazards
-const JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
-const JEV_MODEL = "jev-latest";
-
-interface JevNoteAudit {
-  actionable: number; // 0..1
-  completeness: number; // 0..2
-  readiness: string; // "ready" | "needs_detail" | "insufficient"
-  confidence: number;
-}
-
-interface SelfCompactConfig {
-  noticePct: number;
-  warningPct: number;
-  forcePct: number;
-  jevEnabled: boolean;
+// Default context pressure thresholds (percentage of context window used)
+export interface SelfCompactConfig {
+  noticePct: number; // e.g. 70%: notify agent to find clean task milestone
+  warningPct: number; // e.g. 80%: strong recommendation to compact
+  forcePct: number; // e.g. 90%: lock tools, force compaction
+  jevEnabled: boolean; // whether to run TypeSafe Jev quality checks on continuation notes
 }
 
 const DEFAULT_CONFIG: SelfCompactConfig = {
@@ -31,6 +21,15 @@ const DEFAULT_CONFIG: SelfCompactConfig = {
   forcePct: 90,
   jevEnabled: true,
 };
+
+function sanitizeThreshold(val: any, fallback: number, min = 10, max = 99): number {
+  const n = Number(val);
+  if (!Number.isFinite(n) || n < min || n > max) return fallback;
+  return Math.round(n);
+}
+
+const JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
+const JEV_MODEL = "jev-latest";
 
 function resolveJevApiKey(): string | undefined {
   if (process.env.TYPESAFE_API_KEY?.trim()) {
@@ -52,45 +51,49 @@ function resolveJevApiKey(): string | undefined {
   return undefined;
 }
 
-async function auditContinuationNoteWithJev(
+export interface JevAuditResult {
+  readiness: "ready" | "needs_work" | "rejected";
+  completeness: number; // 0 to 2 rubric
+  actionable: number; // 0 to 1 probability
+}
+
+export async function auditContinuationNoteWithJev(
   note: string,
   apiKey: string,
   signal?: AbortSignal,
-): Promise<JevNoteAudit | null> {
+): Promise<JevAuditResult | null> {
   const body = {
-    state: note,
+    state: `Continuation Note:\n${note.slice(0, 3000)}`,
     model: JEV_MODEL,
     questions: {
-      actionable: {
-        type: "noul",
-        instructions:
-          "Does this continuation note clearly specify the next concrete steps, files to touch, or actions to take?",
-      },
       completeness: {
         type: "score",
         instructions:
-          "How completely does this continuation note capture critical task state (completed work, in-progress items, key decisions, file paths)?",
-        criteria: [
-          "Minimal or vague; missing context and next steps",
-          "Partial; mentions tasks or progress but lacks specific files, invariants, or next actions",
-          "Complete and decision-ready; contains explicit progress, files, decisions, and clear next steps",
-        ],
+          "Does this continuation note capture current goal, work done, blockers, key decisions, and concrete next steps?",
+        levels: {
+          "0": "Missing critical sections or too vague to resume work without amnesia",
+          "1": "Covers high-level status but lacks specific file names or immediate next action",
+          "2": "Complete, structured continuation notes with concrete actionable next steps and invariant state",
+        },
       },
       readiness: {
         type: "choice",
-        instructions:
-          "Is this note ready to guide an agent immediately post-compaction without re-investigating?",
+        instructions: "Is this note ready to serve as the sole memory anchor after total conversation history wipe?",
         criteria: {
-          ready: "Contains sufficient guidance and context to continue work immediately",
-          needs_detail: "Lacks key specifics about files, commands, or pending errors",
-          insufficient: "Generic text without actionable project state",
+          ready: "High clarity, comprehensive summary with immediate next steps",
+          needs_work: "Understandable but missing specific file references or context",
+          rejected: "Empty, nonsensical, or completely inadequate",
         },
+      },
+      actionable: {
+        type: "noul",
+        instructions: "Can an engineer resume execution immediately from this note alone?",
       },
     },
   };
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
+  const timer = setTimeout(() => controller.abort(), 4000);
 
   try {
     const res = await fetch(JEV_ENDPOINT, {
@@ -108,12 +111,16 @@ async function auditContinuationNoteWithJev(
     const answers = json?.answers;
     if (!answers) return null;
 
-    return {
-      actionable: answers.actionable?.noul ?? 0.5,
-      completeness: answers.completeness?.score ?? 1.0,
-      readiness: answers.readiness?.choice ?? "ready",
-      confidence: answers.readiness?.confidence ?? 0.5,
-    };
+    const completenessRaw = answers.completeness?.score;
+    const completeness = typeof completenessRaw === "number" && Number.isFinite(completenessRaw) ? completenessRaw : 1.5;
+
+    const readinessRaw = answers.readiness?.choice;
+    const readiness = ["ready", "needs_work", "rejected"].includes(readinessRaw) ? readinessRaw : "ready";
+
+    const actionableRaw = answers.actionable?.noul;
+    const actionable = typeof actionableRaw === "number" && Number.isFinite(actionableRaw) ? actionableRaw : 0.8;
+
+    return { completeness, readiness, actionable };
   } catch {
     return null;
   } finally {
@@ -121,59 +128,26 @@ async function auditContinuationNoteWithJev(
   }
 }
 
-async function evaluateCheckpointWithJev(
-  stateSummary: string,
-  apiKey: string,
-  signal?: AbortSignal,
-): Promise<{ timingAdvice: string; isSafeMilestone: number } | null> {
-  const body = {
-    state: stateSummary,
-    model: JEV_MODEL,
-    questions: {
-      is_safe_milestone: {
-        type: "noul",
-        instructions:
-          "Is the agent at a clean stopping point or task milestone where compaction will not disrupt an unfinished in-flight operation (like an unverified edit or incomplete command)?",
-      },
-      timing_advice: {
-        type: "choice",
-        instructions: "How should compaction be timed given the current task status?",
-        criteria: {
-          compact_now: "Current subtask is finished; ideal moment to compact before starting new work",
-          finish_step_first: "In the middle of an edit, test, or debugging step; finish this step before compacting",
-          urgent_compact: "Context is overflowing; must compact immediately regardless of task state",
-        },
-      },
-    },
-  };
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
-
+export function writeNoteBackupAtomic(backupPath: string, content: string): boolean {
   try {
-    const res = await fetch(JEV_ENDPOINT, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: signal ? AbortSignal.any([controller.signal, signal]) : controller.signal,
-    });
+    const dir = join(backupPath, "..");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
 
-    if (!res.ok) return null;
-    const json = (await res.json()) as any;
-    const answers = json?.answers;
-    if (!answers) return null;
+    if (existsSync(backupPath)) {
+      try {
+        const stat = lstatSync(backupPath);
+        if (stat.isSymbolicLink()) {
+          unlinkSync(backupPath);
+        }
+      } catch {}
+    }
 
-    return {
-      isSafeMilestone: answers.is_safe_milestone?.noul ?? 0.5,
-      timingAdvice: answers.timing_advice?.choice ?? "finish_step_first",
-    };
+    const tempFile = join(dir, `.tmp_compact_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+    writeFileSync(tempFile, content, { encoding: "utf8", mode: 0o600 });
+    renameSync(tempFile, backupPath);
+    return true;
   } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
+    return false;
   }
 }
 
@@ -184,19 +158,22 @@ export default function (pi: ExtensionAPI) {
   let lastWarningTime = 0;
 
   const stateDir = join(homedir(), ".pi/state");
-  const noteBackupPath = join(stateDir, "self-compact-last-note.md");
+  const noteBackupPath = join(stateDir, "last-continuation-note.md");
 
-  // Load configuration
+  const notice = sanitizeThreshold(process.env.PI_SELF_COMPACT_NOTICE_PCT, DEFAULT_CONFIG.noticePct);
+  const warning = sanitizeThreshold(process.env.PI_SELF_COMPACT_WARNING_PCT, DEFAULT_CONFIG.warningPct);
+  const force = sanitizeThreshold(process.env.PI_SELF_COMPACT_FORCE_PCT, DEFAULT_CONFIG.forcePct);
+
   const config: SelfCompactConfig = {
-    noticePct: Number(process.env.PI_SELF_COMPACT_NOTICE_PCT) || DEFAULT_CONFIG.noticePct,
-    warningPct: Number(process.env.PI_SELF_COMPACT_WARNING_PCT) || DEFAULT_CONFIG.warningPct,
-    forcePct: Number(process.env.PI_SELF_COMPACT_FORCE_PCT) || DEFAULT_CONFIG.forcePct,
+    noticePct: Math.min(notice, warning - 1),
+    warningPct: warning,
+    forcePct: Math.max(force, warning + 1),
     jevEnabled: process.env.PI_SELF_COMPACT_JEV === "false" ? false : DEFAULT_CONFIG.jevEnabled,
   };
 
   const jevApiKey = resolveJevApiKey();
 
-  // 1. Register the self_compact tool for autonomous agent compaction
+  // 1. Register self_compact tool (conforming to Pi's 5-argument execute signature)
   pi.registerTool({
     name: "self_compact",
     label: "Self-Compact Context",
@@ -215,25 +192,34 @@ export default function (pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(_toolCallId, params, ctx: ExtensionContext) {
-      pendingCarryoverNote = params.note.trim();
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      // Robust resolution of context and cancellation signal
+      const effectiveCtx: ExtensionContext | undefined = ctx || (signal && typeof (signal as any).compact === "function" ? (signal as any) : undefined);
+      const effectiveSignal: AbortSignal | undefined = signal instanceof AbortSignal ? signal : effectiveCtx?.signal;
 
-      // Persist backup to disk
-      try {
-        mkdirSync(stateDir, { recursive: true });
-        writeFileSync(noteBackupPath, pendingCarryoverNote, "utf8");
-      } catch {}
+      const trimmedNote = params.note?.trim();
+      if (!trimmedNote || trimmedNote.length === 0) {
+        throw new Error("Continuation note cannot be empty. Please provide structured notes.");
+      }
+      if (trimmedNote.length > 60000) {
+        throw new Error("Continuation note exceeds maximum size (60,000 characters).");
+      }
+
+      pendingCarryoverNote = trimmedNote;
+
+      // Safe atomic backup to disk
+      writeNoteBackupAtomic(noteBackupPath, pendingCarryoverNote);
 
       let jevReport = "";
       if (config.jevEnabled && jevApiKey) {
-        const audit = await auditContinuationNoteWithJev(params.note, jevApiKey, ctx.signal);
+        const audit = await auditContinuationNoteWithJev(trimmedNote, jevApiKey, effectiveSignal);
         if (audit) {
           const qual = audit.readiness;
           const score = audit.completeness.toFixed(1);
           const act = Math.round(audit.actionable * 100);
           jevReport = `\n[Jev Audit: ${qual.toUpperCase()} (Score: ${score}/2.0, Actionable: ${act}%)]`;
           if (audit.readiness !== "ready") {
-            jevReport += ` Warning: Note may lack concrete next steps or specific files. Note accepted for compaction.`;
+            jevReport += ` Warning: Note may lack concrete next steps. Note accepted for compaction.`;
           }
         }
       }
@@ -242,7 +228,7 @@ export default function (pi: ExtensionAPI) {
       const preservePrompt = `\n\nCRITICAL CONTEXT & CONTINUATION NOTES TO PRESERVE VERBATIM:\n${pendingCarryoverNote}\n${params.customInstructions || ""}`.trim();
 
       // Trigger Pi's native compaction
-      ctx.compact({
+      effectiveCtx?.compact?.({
         customInstructions: preservePrompt,
       });
 
@@ -264,7 +250,7 @@ export default function (pi: ExtensionAPI) {
       const note = args?.trim() || "Manual user-requested compaction";
       pendingCarryoverNote = note;
       ctx.ui?.notify?.("Self-compaction initiated...", "info");
-      ctx.compact({
+      ctx.compact?.({
         customInstructions: `CRITICAL CONTEXT & CONTINUATION NOTES TO PRESERVE:\n${note}`,
       });
     },
@@ -272,7 +258,6 @@ export default function (pi: ExtensionAPI) {
 
   // 3. Tool Call Gate (Force Threshold)
   pi.on("tool_call", async (event, ctx: ExtensionContext) => {
-    // Child workers running isolated subtasks don't manage estate-level root compaction
     if (process.env.PI_CREW_KIND === "subagent" || (process.env.PI_CREW_DEPTH && process.env.PI_CREW_DEPTH !== "0")) {
       return;
     }
@@ -284,7 +269,6 @@ export default function (pi: ExtensionAPI) {
 
     const percent = usage.percent ?? Math.round((usage.tokens / usage.contextWindow) * 100);
 
-    // If context is above force threshold, lock all non-compaction tools
     if (percent >= config.forcePct) {
       if (event.toolName !== "self_compact" && event.toolName !== "yield_control") {
         return {
@@ -295,7 +279,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // 4. Turn End Watchdog (Notice & Warning Thresholds + Jev Checkpoint Evaluation)
+  // 4. Turn End Watchdog (Notice & Warning Thresholds)
   pi.on("turn_end", async (_event, ctx: ExtensionContext) => {
     if (process.env.PI_CREW_KIND === "subagent") {
       return;
@@ -312,15 +296,8 @@ export default function (pi: ExtensionAPI) {
     if (percent >= config.warningPct && percent < config.forcePct) {
       if (now - lastWarningTime > 45000) {
         lastWarningTime = now;
-        let jevNote = "";
-        if (config.jevEnabled && jevApiKey) {
-          const evalRes = await evaluateCheckpointWithJev(`Context tokens: ${usage.tokens}/${usage.contextWindow} (${percent}%)`, jevApiKey, ctx.signal);
-          if (evalRes) {
-            jevNote = ` | Jev: ${evalRes.timingAdvice} (safe milestone: ${Math.round(evalRes.isSafeMilestone * 100)}%)`;
-          }
-        }
         ctx.ui?.notify?.(
-          `[self-compact: Warning] Context usage is at ${percent}%. Approaching limit${jevNote}. Call 'self_compact' with continuation notes to preserve state.`,
+          `[self-compact: Warning] Context usage is at ${percent}%. Approaching limit. Call 'self_compact' with continuation notes to preserve state.`,
           "warning",
         );
       }
@@ -337,16 +314,13 @@ export default function (pi: ExtensionAPI) {
 
   // 5. Compaction Lifecycle Hooks
   pi.on("session_before_compact", async (event) => {
-    // If we have a pending carryover note from self_compact, inject it into the summarizer prompt
     if (pendingCarryoverNote) {
       const addition = `\n\n## MANDATORY CONTINUATION NOTES (Preserve under '## Critical Context'):\n${pendingCarryoverNote}\n`;
       event.customInstructions = (event.customInstructions || "") + addition;
-      activeInjectedNote = pendingCarryoverNote;
     }
   });
 
   pi.on("session_compact", async () => {
-    // After compaction successfully completes, mark that the note should be displayed/injected
     if (pendingCarryoverNote) {
       activeInjectedNote = pendingCarryoverNote;
       pendingCarryoverNote = null;
@@ -354,15 +328,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   // 6. Post-compaction state injection into subsequent turn
-  pi.on("before_agent_start", async (_event, ctx: ExtensionContext) => {
+  pi.on("before_agent_start", async (event, ctx: ExtensionContext) => {
     if (activeInjectedNote) {
       ctx.ui?.notify?.("[self-compact] Restored continuation notes from prior self-compaction.", "info");
-      // Add guidelines into active session so the model immediately sees its working memory
-      _event.systemPromptOptions = _event.systemPromptOptions || {};
-      _event.systemPromptOptions.guidelines = _event.systemPromptOptions.guidelines || [];
-      _event.systemPromptOptions.guidelines.push(
-        `[PRESERVED CONTINUATION NOTES FROM SELF-COMPACTION]:\n${activeInjectedNote}`,
-      );
+      const guidelines = (event.promptGuidelines = event.promptGuidelines || []);
+      guidelines.push(`[PRESERVED CONTINUATION NOTES FROM SELF-COMPACTION]:\n${activeInjectedNote}`);
       activeInjectedNote = null;
     }
   });
