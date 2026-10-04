@@ -8,9 +8,9 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
-// Context pressure thresholds (% of context window). Pi's own auto-compaction fires at
-// contextWindow - reserveTokens (default 16384): ~92% on 200K, ~94% on 272K, ~98% on 1M.
-// Everything here fires before that, so the model gets to write its own continuation notes.
+// Context pressure thresholds (% of the working window, see workingWindowTokens). Pi's own auto-compaction
+// fires at contextWindow - reserveTokens (default 16384): ~92% on 200K, ~94% on 272K, ~98% on 1M. On windows
+// of 200K or less these stages sit before it, so the model gets to write its own continuation notes.
 export interface SelfCompactConfig {
   nudgePct: number; // model-visible steer message asking for self_compact
   autoCompactPct: number; // compact autonomously with a generic note if the model ignored the nudge
@@ -24,8 +24,9 @@ export const DEFAULT_CONFIG: SelfCompactConfig = {
   autoCompactPct: 80,
   forcePct: 88,
   jevEnabled: true,
-  // On a 1M-token model, 70/80/88% of the whole window is ~734K/839K/922K: past where quality drops,
-  // and Pi's own compaction (window - 16384) fires first. Cap the working window instead.
+  // On a 1M-token model, 70/80/88% of the whole window is ~734K/839K/922K: far past where answer quality
+  // drops, and Pi's own compaction (~98%) would only fire after all three. Quality, not window exhaustion,
+  // is the reason for the cap.
   workingWindowTokens: 200_000,
 };
 
@@ -164,7 +165,8 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): SelfCompact
     autoCompactPct: sanitizeThreshold(env.PI_SELF_COMPACT_AUTO_PCT, DEFAULT_CONFIG.autoCompactPct),
     forcePct: sanitizeThreshold(env.PI_SELF_COMPACT_FORCE_PCT, DEFAULT_CONFIG.forcePct),
     jevEnabled: env.PI_SELF_COMPACT_JEV !== "false",
-    workingWindowTokens: /^\d+$/.test(env.PI_SELF_COMPACT_WORKING_WINDOW ?? "")
+    // digits only and a safe integer: 400 digits parse to Infinity, which would silently disable the cap
+    workingWindowTokens: /^\d+$/.test(env.PI_SELF_COMPACT_WORKING_WINDOW ?? "") && Number.isSafeInteger(Number(env.PI_SELF_COMPACT_WORKING_WINDOW))
       ? Number(env.PI_SELF_COMPACT_WORKING_WINDOW)
       : DEFAULT_CONFIG.workingWindowTokens,
   };
@@ -175,7 +177,8 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): SelfCompact
   return cfg;
 }
 
-const QUIET_MS = 100; // after settling, how long no other run may start before we compact
+const RUN_COMMAND = "self-compact-run"; // internal: Pi runs it once the settled session has drained
+const RESUME_START_MS = 2000; // how long to wait for the resume run to begin before giving up on it
 export const CONTINUATION_CUSTOM_TYPE = "self_compact_continuation";
 
 export function continuationContent(note: string | null): string {
@@ -190,10 +193,11 @@ function isSubagent(): boolean {
 
 export function usagePercent(ctx: ExtensionContext, workingWindow = 0): number | null {
   const usage = ctx.getContextUsage?.();
-  if (!usage || usage.tokens === null || !usage.contextWindow) return null;
+  // Unknown or non-finite numbers are "unknown", never a percentage: NaN compares false against every threshold.
+  if (!usage || !Number.isFinite(usage.tokens) || !Number.isFinite(usage.contextWindow) || usage.contextWindow <= 0) return null;
   const window = workingWindow > 0 ? Math.min(workingWindow, usage.contextWindow) : usage.contextWindow;
-  if (window === usage.contextWindow && usage.percent != null) return usage.percent;
-  return Math.round((usage.tokens / window) * 100);
+  if (window === usage.contextWindow && Number.isFinite(usage.percent)) return usage.percent;
+  return Math.round((usage.tokens! / window) * 100);
 }
 
 // Per-workspace backup so one repo's note is never replayed into another (pi-prime reads this
@@ -222,6 +226,11 @@ export default function (pi: ExtensionAPI) {
   // a stopped run drops the pending compaction instead of compacting and resuming against the stop.
   let pending: { note: string; extra: string } | null = null;
   let armed = false;
+  // A job handed to Pi's settle queue (see agent_settled); the RUN_COMMAND takes it once the queue reaches it.
+  let dispatched: { note: string; extra: string } | null = null;
+  let settledClean = false; // the run that just ended passed agent_before_settle, i.e. nobody stopped it
+  let settles = 0; // agent_settled count: shows the resume run has ended
+  let onCompactionEnd: ((resumed: boolean) => void) | null = null; // wakes the command that waits for the compaction
   let runs = 0; // agent_start count: shows whether a run began after we settled
   let cancelled = false; // the in-flight compaction was aborted (user/extension cancel): never resume
   let disposed = false; // session shut down: callbacks must not touch the stale ctx
@@ -271,10 +280,16 @@ export default function (pi: ExtensionAPI) {
 
   // Only ever called on a settled run (agent_settled) or by the user's /self-compact, so the
   // abort() inside AgentSession.compact() never cuts work short. Resume from onComplete/onError.
-  function startCompaction(ctx: ExtensionContext, note: string, wantResume: boolean, extra = ""): boolean {
+  function startCompaction(ctx: ExtensionContext, note: string, wantResume: boolean, extra = "", ended?: (resumed: boolean) => void): boolean {
     if (compacting || disposed) return false;
     compacting = true;
     cancelled = false;
+    onCompactionEnd = ended ?? null;
+    const end = (resumed: boolean) => {
+      const done = onCompactionEnd;
+      onCompactionEnd = null;
+      done?.(resumed);
+    };
     const cwd = ctx.cwd || process.cwd();
     writeNoteBackupAtomic(noteBackupPathFor(cwd), formatNoteBackup(cwd, note));
     try {
@@ -283,23 +298,29 @@ export default function (pi: ExtensionAPI) {
         onComplete: () => {
           compacting = false;
           nudged = false;
-          if (wantResume && mayResume(ctx)) resume(continuationContent(note));
+          if (wantResume && mayResume(ctx)) {
+            resume(continuationContent(note));
+            return end(true);
+          }
+          end(false);
         },
         onError: (error) => {
           compacting = false;
-          if (disposed) return;
-          if (cancelled) return; // a cancel is a stop boundary, not a failure to recover from
+          if (disposed || cancelled) return end(false); // a cancel is a stop boundary, not a failure to recover from
           compactionFailed = true;
           safeNotify(ctx, `[self-compact] Compaction failed: ${error.message}`, "error");
           // The run stopped for this compaction; resume so a failed compaction never strands the agent.
-          if (wantResume && !disposed && resumeStreak < MAX_CONSECUTIVE_RESUMES) {
+          if (wantResume && resumeStreak < MAX_CONSECUTIVE_RESUMES) {
             resumeStreak++;
             resume(`[self-compact] Compaction failed (${error.message}); context was NOT reduced. Continue the active task; auto-compaction and the tool gate are paused until a compaction succeeds.`);
+            return end(true);
           }
+          end(false);
         },
       });
     } catch {
       compacting = false;
+      onCompactionEnd = null;
       return false;
     }
     return true;
@@ -365,6 +386,7 @@ export default function (pi: ExtensionAPI) {
       const note = args?.trim().slice(0, 60000) || "Manual user-requested compaction.";
       resumeStreak = 0;
       pending = null; // the user's compaction replaces any scheduled one
+      dispatched = null;
       armed = false;
       // Only resume a run the user interrupted; an idle session stays idle.
       if (!startCompaction(ctx, note, ctx.isIdle?.() === false)) {
@@ -454,7 +476,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_before_settle", async (event: any, ctx: ExtensionContext) => {
     // Pi only gets here when no abort was requested before the boundary; an aborted or failed run never arms.
-    if (pending && event?.outcome !== "aborted" && event?.outcome !== "error") armed = true;
+    settledClean = event?.outcome !== "aborted" && event?.outcome !== "error";
+    if (pending && settledClean) armed = true;
     if (!resumeAtSettle) return;
     resumeAtSettle = false;
     const note = supersededNote;
@@ -467,6 +490,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async (_event, ctx: ExtensionContext) => {
+    settles++;
+    const clean = settledClean;
+    settledClean = false;
+    if (dispatched && !clean) {
+      // A run that Pi drained ahead of our compaction was stopped: that is a stop boundary, so drop the job.
+      dispatched = null;
+      safeNotify(ctx, "[self-compact] The run was stopped, so the scheduled compaction was skipped.", "info");
+    }
     const job = pending;
     const go = armed;
     pending = null;
@@ -476,38 +507,62 @@ export default function (pi: ExtensionAPI) {
       safeNotify(ctx, "[self-compact] The run was stopped, so the scheduled compaction was skipped.", "info");
       return;
     }
-    // Wait out a short quiet period after the settle handlers: a continuation another extension queued
-    // there (Pi runs it right after them) goes first, and this compaction waits for that run to end.
-    // ponytail: Pi 1.0.0 shows extensions neither a stop pressed after agent_before_settle nor the end of
-    // other extensions' settle handlers. A stop in that window (handlers + QUIET_MS) is missed, and a
-    // handler slower than QUIET_MS can still overlap. A stop once compaction has started cancels it, and
-    // a cancelled compaction never resumes. Upgrade path: a Pi hook that runs after deferred settle actions.
-    const gen = runs;
-    let waited = 0;
-    const check = () => {
-      if (disposed || compacting) return;
-      let idle = false;
-      try { idle = ctx.isIdle(); } catch { return; }
-      if (runs !== gen || !idle) {
-        pending ??= job; // compact when that run settles
+    // Hand the job to Pi's own settle queue instead of racing it with timers. Pi runs the queue once every
+    // agent_settled handler has returned (however slow), in order, and awaits each entry. So RUN_COMMAND starts
+    // after the runs other extensions queued ahead of us have fully ended, and anything queued behind it
+    // waits for the command, which returns only once the compaction and the resume run are over.
+    // ponytail: Pi 1.0.0 shows extensions no stop pressed while other extensions' settle handlers are still
+    // running (the session is idle, so abort() has nothing to abort). Such a stop is missed. Once the compaction
+    // has started a stop cancels it, and a cancelled compaction never resumes; a run stopped while the queue
+    // drains is seen (dispatched check above). Upgrade path: a Pi event for a stop while idle.
+    dispatched = job;
+    try {
+      pi.sendUserMessage(`/${RUN_COMMAND}`, { expandPromptTemplates: true });
+    } catch {
+      dispatched = null; // stale runtime after shutdown
+    }
+  });
+
+  pi.registerCommand(RUN_COMMAND, {
+    description: "Internal: runs a scheduled self-compaction once the settled session has drained (not meant to be typed)",
+    handler: async (_args, ctx) => {
+      const job = dispatched;
+      dispatched = null;
+      if (!job || disposed) return;
+      if (!ctx.isIdle()) {
+        pending ??= job; // something is running or compacting: compact when that settles
         return;
       }
-      if (waited < QUIET_MS) {
-        waited += 10;
-        setTimeout(check, 10);
-        return;
-      }
-      startCompaction(ctx, job.note, true, job.extra);
-    };
-    setTimeout(check, 0);
+      const since = runs;
+      const settledBefore = settles;
+      const resumed = await new Promise<boolean>((done) => {
+        if (!startCompaction(ctx, job.note, true, job.extra, done)) done(false);
+      });
+      if (!resumed || disposed) return;
+      // Keep Pi's settle queue blocked until the resume run is over too, so nothing queued behind us overlaps it.
+      // (ctx.waitForIdle is a no-op unless the host bound command actions, so poll our own counters.)
+      // ponytail: polling at 10 ms; a settle handler that outlives the resume run's last settle is not waited for.
+      await until(() => disposed || runs !== since, RESUME_START_MS);
+      if (runs === since) return; // the resume never started
+      await until(() => disposed || settles !== settledBefore);
+      await until(() => disposed || ctx.isIdle());
+    },
   });
 
   pi.on("session_shutdown", async () => {
     disposed = true;
     resumeAtSettle = false;
     pending = null;
+    dispatched = null;
     armed = false;
+    const end = onCompactionEnd;
+    onCompactionEnd = null;
+    end?.(false); // release a command still waiting on a compaction that will never report
   });
+}
+
+async function until(ok: () => boolean, ms = Infinity) {
+  for (const t0 = Date.now(); !ok() && Date.now() - t0 < ms; ) await new Promise((r) => setTimeout(r, 10));
 }
 
 function safeNotify(ctx: ExtensionContext, msg: string, level: "info" | "warning" | "error") {

@@ -16,7 +16,9 @@ function harness() {
   const commands = new Map<string, any>();
   const handlers = new Map<string, Function>();
   const sent: { message: any; options: any }[] = [];
+  const queued: { text: string; options: any }[] = []; // Pi's settle queue: prompts sent while agent_settled handlers run
   const pi: any = {
+    sendUserMessage: (text: string, options: any) => queued.push({ text, options }),
     registerTool: (t: any) => tools.set(t.name, t),
     registerCommand: (n: string, c: any) => commands.set(n, c),
     on: (e: string, h: Function) => handlers.set(e, h),
@@ -44,7 +46,15 @@ function harness() {
     getContextUsage: () => usageOverride ?? { tokens: percent * 1000, contextWindow: 100000, percent },
   };
   return {
-    tools, commands, handlers, sent, compacts, ctx,
+    tools, commands, handlers, sent, compacts, ctx, queued,
+    // Pi drains the settle queue after the handlers: slash commands run (and are awaited) in order
+    drain: async () => {
+      const was = idle;
+      idle = true; // the queue drains on a settled, idle session
+      for (const q of queued.splice(0)) void commands.get(q.text.slice(1))?.handler("", ctx);
+      await new Promise((r) => setTimeout(r, 5));
+      idle = was;
+    },
     setPercent: (p: number) => (percent = p),
     setIdle: (v: boolean) => (idle = v),
     setUsage: (u: any) => (usageOverride = u),
@@ -55,7 +65,8 @@ function harness() {
       idle = true; // a settled run is idle
       await handlers.get("agent_before_settle")!({ outcome }, ctx);
       await handlers.get("agent_settled")!({}, ctx);
-      await new Promise((r) => setTimeout(r, 160)); // compaction starts after a quiet period
+      for (const q of queued.splice(0)) void commands.get(q.text.slice(1))?.handler("", ctx);
+      await new Promise((r) => setTimeout(r, 5));
       idle = was;
     },
   };
@@ -108,19 +119,64 @@ function harness() {
   await h.tools.get("self_compact").execute("c2", { note: "n" }, undefined, () => {}, h.ctx);
   await h.settle("error");
   assert.equal(h.compacts.length, 0, "error outcome: no compaction");
-  // a run another extension starts from its settle handler: compaction waits for that run to settle
+  // the compaction goes through Pi's settle queue (no timers), as an expandPromptTemplates slash command
   await h.tools.get("self_compact").execute("c3", { note: "Goal: later" }, undefined, () => {}, h.ctx);
   await h.emit("agent_before_settle", { outcome: "completed" });
   await h.emit("agent_settled");
-  await new Promise((r) => setTimeout(r, 30)); // a slow settle handler of another extension
-  await h.emit("agent_start"); // its deferred continuation began
-  await new Promise((r) => setTimeout(r, 160));
-  assert.equal(h.compacts.length, 0, "never compacts under another run");
-  assert.equal((await h.emit("tool_call", { toolName: "bash" }))?.terminate, true, "that run ends at its next tool call");
-  await h.settle();
-  assert.equal(h.compacts.length, 1);
+  assert.equal(h.queued.length, 1, "job handed to Pi's settle queue");
+  assert.deepEqual(h.queued[0], { text: "/self-compact-run", options: { expandPromptTemplates: true } });
+  assert.equal(h.compacts.length, 0, "nothing compacts until Pi drains the queue");
+  // an earlier queue entry (another extension's continuation) runs to the end first, cleanly
+  await h.emit("agent_start");
+  assert.equal((await h.emit("tool_call", { toolName: "bash" }))?.terminate, undefined, "that run is not ours to end");
+  await h.emit("agent_before_settle", { outcome: "completed" });
+  await h.emit("agent_settled");
+  await h.drain();
+  assert.equal(h.compacts.length, 1, "compacts once, after that run");
   assert.match(h.compacts[0].customInstructions, /Goal: later/);
-  console.log("✓ aborted/error outcomes never arm; a continuation queued by another extension runs first");
+  await h.drain();
+  assert.equal(h.compacts.length, 1, "a duplicate queue entry is a no-op");
+  console.log("✓ aborted/error outcomes never arm; the compaction runs from Pi's settle queue after earlier runs");
+}
+
+// 1d. A run Pi drains ahead of our queued compaction is stopped by the user: stop wins, no compaction, no resume
+{
+  const h = harness();
+  await h.tools.get("self_compact").execute("c1", { note: "n" }, undefined, () => {}, h.ctx);
+  await h.emit("agent_before_settle", { outcome: "completed" });
+  await h.emit("agent_settled");
+  await h.emit("agent_start"); // another extension's continuation
+  await h.emit("agent_settled"); // stopped: Pi skipped agent_before_settle
+  await h.drain();
+  assert.equal(h.compacts.length, 0, "a stop in the queue cancels the job");
+  assert.equal(h.sent.length, 0);
+  await h.settle();
+  assert.equal(h.compacts.length, 0, "and it does not come back");
+  console.log("✓ stop while Pi drains the settle queue: job cancelled");
+}
+
+// 1e. The command waits for the compaction and the resume run, so nothing queued behind it overlaps
+{
+  const h = harness();
+  await h.tools.get("self_compact").execute("c1", { note: "n" }, undefined, () => {}, h.ctx);
+  let done = false;
+  await h.emit("agent_before_settle", { outcome: "completed" });
+  await h.emit("agent_settled");
+  h.setIdle(true);
+  const run = h.commands.get("self-compact-run").handler("", h.ctx).then(() => (done = true));
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(done, false, "still waiting on the compaction");
+  h.compacts[0].onComplete({});
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(done, false, "still waiting for the resume run to start");
+  await h.emit("agent_start");
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(done, false, "still waiting for the resume run to end");
+  await h.emit("agent_before_settle", { outcome: "completed" });
+  await h.emit("agent_settled");
+  await run;
+  assert.equal(done, true);
+  console.log("✓ settle-queue command returns only after compaction and resume run are over");
 }
 
 // 2. onError releases the guard, still resumes (the run stopped for it), and stops auto-retry loops
@@ -353,4 +409,34 @@ console.log("\nALL TESTS PASSED");
   assert.equal(resolveConfig({ PI_SELF_COMPACT_WORKING_WINDOW: "0" } as any).workingWindowTokens, 0);
   assert.equal(resolveConfig({ PI_SELF_COMPACT_WORKING_WINDOW: "x" } as any).workingWindowTokens, 200_000, "invalid → default");
   console.log("✓ working-window cap: 1M models compact at 80% of 200K, small windows unchanged, env override");
+}
+
+// Non-finite usage numbers are "unknown": NaN compares false against every threshold, so it must never gate
+{
+  const { usagePercent } = await import("./index.ts");
+  const p = (u: any, cap = 200_000) => usagePercent({ getContextUsage: () => u } as any, cap);
+  assert.equal(p({ tokens: 50_000, contextWindow: 128_000, percent: NaN }), 39, "NaN percent: recompute from tokens/window");
+  assert.equal(p({ tokens: 140_000, contextWindow: 1_000_000, percent: NaN }), 70, "NaN percent on a capped window");
+  assert.equal(p({ tokens: 140_000, contextWindow: 1_000_000, percent: null }), 70);
+  assert.equal(p({ tokens: NaN, contextWindow: 128_000, percent: 5 }), null, "NaN tokens: unknown");
+  assert.equal(p({ tokens: undefined, contextWindow: 128_000, percent: undefined }), null, "missing tokens: unknown");
+  assert.equal(p({ tokens: null, contextWindow: 1_000_000, percent: 96 }), null, "post-compaction null tokens: unknown");
+  assert.equal(p({ tokens: 10, contextWindow: 0, percent: 0 }), null);
+  assert.equal(p({ tokens: 10, contextWindow: NaN, percent: 1 }), null);
+  const h = harness();
+  h.setUsage({ tokens: 1000, contextWindow: 128_000, percent: NaN });
+  assert.equal(await h.emit("tool_call", { toolName: "bash" }), undefined, "a 1,000-token context is never force-gated");
+  h.setUsage({ tokens: 1000, contextWindow: NaN, percent: 99 });
+  assert.equal(await h.emit("tool_call", { toolName: "bash" }), undefined, "unknown window never gates");
+  console.log("✓ non-finite usage: recomputed or unknown, never gates");
+}
+
+// PI_SELF_COMPACT_WORKING_WINDOW: digits only AND a safe integer (400 digits parse to Infinity and would disable the cap)
+{
+  const w = (v: string) => resolveConfig({ PI_SELF_COMPACT_WORKING_WINDOW: v } as any).workingWindowTokens;
+  for (const bad of ["9".repeat(400), "9007199254740993", "-1", "1e5", " 0", "0x10", "1.5", ""]) assert.equal(w(bad), 200_000, `${bad.slice(0, 20)} → default`);
+  assert.equal(w("0"), 0, "0 = the whole window");
+  assert.equal(w("9007199254740991"), 9007199254740991, "largest safe integer is accepted");
+  assert.equal(w("300000"), 300_000);
+  console.log("✓ working window env: finite safe integers only");
 }

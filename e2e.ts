@@ -15,18 +15,27 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import selfCompact from "./index.ts";
 
 process.env.PI_SELF_COMPACT_JEV = "false";
+delete process.env.PI_CREW_KIND; // the gate is off inside pi-crew subagents; the test must not inherit that
+delete process.env.PI_CREW_DEPTH;
 process.env.PI_SELF_COMPACT_STATE_DIR = mkdtempSync(join(tmpdir(), "self-compact-e2e-")); // never the real backup
 
 let extra: any[] = []; // other extensions loaded beside self-compact
 let current: any;
-async function run(name: string, reserveTokens: number, responses: any[], prompts: string | string[], onEvent?: (session: any, e: any) => void) {
-  const faux = fauxProvider({ models: [{ id: "faux", contextWindow: 20000, maxTokens: 500 }] });
+async function run(name: string, reserveTokens: number, responses: any[], prompts: string | string[], onEvent?: (session: any, e: any) => void, opts: { window?: number; extraFirst?: boolean; afterMs?: number } = {}) {
+  const faux = fauxProvider({ models: [{ id: "faux", contextWindow: opts.window ?? 20000, maxTokens: 500 }] });
+  if (opts.window) {
+    // the faux provider simulates prompt caching, which inflates usage; the capped-window cases need exact token counts
+    for (const key of ["stream", "streamSimple"]) {
+      const original = (faux.provider as any)[key];
+      (faux.provider as any)[key] = (m: any, c: any, o: any) => original(m, c, { ...o, cacheRetention: "none" });
+    }
+  }
   faux.setResponses(responses.map((r) => (typeof r === "function" ? r : () => ({ ...r, timestamp: Date.now() }))));
   const dir = mkdtempSync(join(tmpdir(), "pi-e2e-"));
   const modelRuntime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null });
   modelRuntime.registerNativeProvider(faux.provider);
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: true, reserveTokens, keepRecentTokens: 50 } });
-  const resourceLoader = new DefaultResourceLoader({ cwd: dir, agentDir: dir, settingsManager, extensionFactories: [selfCompact, ...extra], noSkills: true, noPromptTemplates: true });
+  const resourceLoader = new DefaultResourceLoader({ cwd: dir, agentDir: dir, settingsManager, extensionFactories: opts.extraFirst ? [...extra, selfCompact] : [selfCompact, ...extra], noSkills: true, noPromptTemplates: true });
   await resourceLoader.reload();
   const { session } = await createAgentSession({
     cwd: dir,
@@ -48,6 +57,7 @@ async function run(name: string, reserveTokens: number, responses: any[], prompt
   // Resume after our own compaction is asynchronous (onComplete -> sendMessage triggerTurn); wait for it.
   for (let i = 0; i < 100 && faux.getPendingResponseCount() > 0; i++) await new Promise((r) => setTimeout(r, 50));
   await (session as any).waitForIdle?.();
+  if (opts.afterMs) await new Promise((r) => setTimeout(r, opts.afterMs)); // let any (wrong) late compaction or resume happen
   const msgs = session.messages as any[];
   const roles = msgs.map((m) => (m.role === "custom" ? `custom:${m.customType}` : m.role));
   const last = msgs.at(-1);
@@ -157,8 +167,8 @@ assert.ok(!/SHOULD NOT RUN/.test(eRun.lastText), "stopped after the tool: no res
 assert.equal(eRun.pending, 2, "neither the summary nor the resume response was requested");
 console.log("✓ E: stop right after self_compact returns neither compacts nor resumes");
 
-// F: another extension continues the run from its (slow) agent_settled handler. Its run goes first;
-// the compaction starts only after that run has settled, never underneath it.
+// F: another extension continues the run from its (slow) agent_settled handler. Pi drains its settle queue in
+// order and awaits each entry, so the compaction and the other run never overlap, whichever is queued first.
 let other = false;
 const overlaps: boolean[] = [];
 extra = [(pi: any) => pi.on("agent_settled", async () => {
@@ -185,7 +195,7 @@ extra = [];
 assert.deepEqual(overlaps, [false, false], "no run may stream while the compaction is in flight");
 assert.equal(fRun.pending, 0);
 assert.match(fRun.lastText, /RESUMED/);
-console.log("✓ F: a run another extension starts at settle goes first; compaction never overlaps it");
+console.log("✓ F: a run another extension starts at settle never overlaps the compaction");
 
 // G: mixed batch. A plain tool ran before self_compact in the same batch, so Pi makes one more model
 // request (it terminates only when every result does). Compaction and resume still happen afterwards.
@@ -208,5 +218,155 @@ assert.ok(gRun.events.includes("compaction_end:manual"), "mixed batch still comp
 assert.equal(gRun.pending, 0);
 assert.match(gRun.lastText, /RESUMED after mixed batch/);
 console.log("✓ G: mixed batch: one extra request, its tool call ends the turn, then compaction + resume");
+
+
+
+// H: another extension's continuation starts AND finishes before any timer could look (no delay in its handler).
+// The scheduled job must survive: the compaction still runs and resumes, in either queue order.
+for (const extraFirst of [false, true]) {
+  let queued = false;
+  extra = [(pi: any) => pi.on("agent_settled", () => {
+    if (queued || !current.messages.some((m: any) => m.role === "toolResult" && m.toolName === "self_compact")) return;
+    queued = true;
+    pi.sendMessage({ customType: "other", content: "other task", display: true }, { triggerTurn: true });
+  })];
+  const starts: string[] = [];
+  const hRun = await run(
+    `fast-continuation-${extraFirst ? "other-first" : "self-first"}`,
+    1000,
+    [
+      fauxAssistantMessage("ack " + "z".repeat(3000)),
+      fauxAssistantMessage(fauxToolCall("self_compact", { note: "ship" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("## summary or OTHER RUN DONE"),
+      fauxAssistantMessage("OTHER RUN DONE or ## summary"),
+      fauxAssistantMessage("RESUMED"),
+    ],
+    ["background " + "context ".repeat(800), "do the task"],
+    (_s, ev) => { if (["compaction_start", "agent_start"].includes(ev.type)) starts.push(ev.type); },
+    { extraFirst, afterMs: 700 },
+  );
+  extra = [];
+  assert.ok(starts.includes("compaction_start"), `fast continuation (${extraFirst ? "other first" : "self first"}): the compaction must still run`);
+  assert.ok(hRun.roles.includes("custom:self_compact_continuation"), "and the agent resumes");
+  assert.equal(hRun.pending, 0);
+}
+console.log("✓ H: a continuation that starts and finishes inside the settle phase does not lose the scheduled compaction");
+
+// I: slow agent_settled handlers (350 ms) and a slow other run: the compaction never runs under a run, nor a run under the compaction
+for (const extraFirst of [false, true]) {
+  let queued = false;
+  extra = [(pi: any) => pi.on("agent_settled", async () => {
+    if (queued || !current.messages.some((m: any) => m.role === "toolResult" && m.toolName === "self_compact")) return;
+    queued = true;
+    pi.sendMessage({ customType: "other", content: "OTHER WORK", display: true }, { triggerTurn: true });
+    await new Promise((r) => setTimeout(r, 350));
+  })];
+  const slow = (ms: number, text: string) => async () => { await new Promise((r) => setTimeout(r, ms)); return fauxAssistantMessage(text, { timestamp: Date.now() }); };
+  let compactingNow = false;
+  const bad: string[] = [];
+  await run(
+    `slow-handler-${extraFirst ? "other-first" : "self-first"}`,
+    1000,
+    [
+      fauxAssistantMessage("ack " + "z".repeat(3000)),
+      fauxAssistantMessage(fauxToolCall("self_compact", { note: "ship" }), { stopReason: "toolUse" }),
+      slow(500, "## summary"),
+      slow(500, "RESUMED or OTHER RUN DONE"),
+      slow(500, "OTHER RUN DONE or RESUMED"),
+    ],
+    ["background " + "context ".repeat(800), "do the task"],
+    (session, ev) => {
+      if (ev.type === "compaction_start") { compactingNow = true; if (session.isStreaming) bad.push("compaction started under a run"); }
+      if (ev.type === "compaction_end") { compactingNow = false; if (session.isStreaming) bad.push("run streaming at compaction_end"); }
+      if (ev.type === "agent_start" && compactingNow) bad.push("run started during the compaction");
+    },
+    { extraFirst, afterMs: 500 },
+  );
+  extra = [];
+  assert.deepEqual(bad, [], `slow settle handler (${extraFirst ? "other first" : "self first"}): runs and compaction never overlap`);
+}
+console.log("✓ I: slow settle handlers cannot make a run and the compaction overlap");
+
+// J: the user presses stop 30 ms after the run settled. The compaction is already underway (the settle
+// queue starts it right after the handlers), so the stop cancels it and nothing resumes.
+{
+  let stopped = false;
+  const jRun = await run(
+    "stop-after-settle",
+    1000,
+    [
+      fauxAssistantMessage("ack " + "z".repeat(3000)),
+      fauxAssistantMessage(fauxToolCall("self_compact", { note: "ship" }), { stopReason: "toolUse" }),
+      async () => { await new Promise((r) => setTimeout(r, 300)); return fauxAssistantMessage("## summary", { timestamp: Date.now() }); },
+      fauxAssistantMessage("RESUMED DESPITE STOP"),
+    ],
+    ["background " + "context ".repeat(800), "do the task"],
+    (session, ev) => {
+      if (ev.type === "agent_settled" && !stopped && session.messages.some((m: any) => m.role === "toolResult" && m.toolName === "self_compact")) {
+        stopped = true;
+        setTimeout(() => void session.abort(), 30);
+      }
+    },
+    { afterMs: 400 },
+  );
+  assert.ok(stopped);
+  assert.ok(!jRun.roles.includes("custom:self_compact_continuation"), "a stop 30 ms after settle must prevent the resume");
+  assert.ok(!/RESUMED DESPITE STOP/.test(jRun.lastText));
+  console.log("✓ J: stop shortly after settle: no resume");
+}
+
+// K: background work is never killed by the gate or the scheduler. A detached worker launched before the
+// force gate (simulating a subagent) finishes untouched; a tool still running in the same batch as
+// self_compact completes before the compaction starts and is never handed an abort.
+{
+  let launched = 0, completed = 0, aborted = 0, slowDone = 0, slowAborted = 0;
+  extra = [(pi: any) => {
+    pi.registerTool({ name: "bg_launch", label: "bg", description: "background worker", parameters: { type: "object", properties: {} },
+      execute: async (_id: any, _p: any, signal: any) => { launched++; signal?.addEventListener("abort", () => aborted++); setTimeout(() => completed++, 1200); return { content: [{ type: "text", text: "worker launched" }] }; } });
+    pi.registerTool({ name: "slow", label: "slow", description: "tool that is still running when self_compact executes", parameters: { type: "object", properties: {} },
+      execute: async (_id: any, _p: any, signal: any) => { signal?.addEventListener("abort", () => slowAborted++); await new Promise((r) => setTimeout(r, 400)); slowDone++; return { content: [{ type: "text", text: "slow done" }] }; } });
+  }];
+  let gate = false, slowDoneAtCompaction = -1;
+  const kRun = await run(
+    "background-work",
+    1000,
+    [
+      fauxAssistantMessage(fauxToolCall("bg_launch", {}), { stopReason: "toolUse" }),
+      fauxAssistantMessage("ack"),
+      fauxAssistantMessage([{ type: "text", text: "x".repeat(190000) }, fauxToolCall("bg_launch", {})], { stopReason: "toolUse" }), // pushes usage over the force line (176K of the 200K working window), so this call is gated
+      fauxAssistantMessage("## summary"),
+      fauxAssistantMessage("## turn prefix"),
+      fauxAssistantMessage("RESUMED"),
+    ],
+    ["x".repeat(520000), "next"],
+    (_s, ev) => { if (ev.type === "tool_execution_end" && JSON.stringify(ev.result).includes("FORCE GATE")) gate = true; },
+    { window: 1_000_000, afterMs: 1500 },
+  );
+  assert.ok(gate, "the force gate fired at >176K tokens of a 1M window");
+  assert.equal(launched, 1);
+  assert.equal(completed, 1, "the background worker finished");
+  assert.equal(aborted, 0, "the gate and the compaction never aborted it");
+  assert.equal(kRun.pending, 0);
+  const mRun = await run(
+    "in-flight-tool",
+    1000,
+    [
+      fauxAssistantMessage("ack " + "z".repeat(3000)),
+      fauxAssistantMessage([fauxToolCall("slow", {}), fauxToolCall("self_compact", { note: "ship" })], { stopReason: "toolUse" }),
+      fauxAssistantMessage(fauxToolCall("slow", {}), { stopReason: "toolUse" }), // the extra request: blocked, ends the turn
+      fauxAssistantMessage("## summary"),
+      fauxAssistantMessage("## turn prefix"),
+      fauxAssistantMessage("RESUMED"),
+    ],
+    ["background " + "context ".repeat(800), "do the task"],
+    (_s, ev) => { if (ev.type === "compaction_start") slowDoneAtCompaction = slowDone; },
+  );
+  extra = [];
+  assert.equal(slowDone, 1, "the tool that was already running completed");
+  assert.equal(slowDoneAtCompaction, 1, "and the compaction started only after it");
+  assert.equal(slowAborted, 0, "it was never handed an abort");
+  assert.match(mRun.lastText, /RESUMED/);
+  console.log("✓ K: background workers and in-flight tools survive the force gate and the scheduled compaction");
+}
 
 console.log("\nE2E PASSED");
