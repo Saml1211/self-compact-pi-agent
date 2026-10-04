@@ -1,6 +1,6 @@
 {
   "name": "self-compact-pi-agent",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Autonomous context lifecycle management & structured memory preservation for Pi Coding Agent",
   "main": "index.ts",
   "scripts": {

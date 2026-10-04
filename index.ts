@@ -26,7 +26,7 @@ export const DEFAULT_CONFIG: SelfCompactConfig = {
   jevEnabled: true,
   // On a 1M-token model, 70/80/88% of the whole window is ~734K/839K/922K: past where quality drops,
   // and Pi's own compaction (window - 16384) fires first. Cap the working window instead.
-  workingWindowTokens: 300_000,
+  workingWindowTokens: 200_000,
 };
 
 function sanitizeThreshold(val: any, fallback: number, min = 10, max = 99): number {
