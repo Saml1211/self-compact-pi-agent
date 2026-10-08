@@ -29,6 +29,7 @@ function harness() {
   let percent = 10;
   let idle = false;
   let usageOverride: any;
+  const notices: { msg: string; level: string }[] = [];
   const ctx: any = {
     cwd: "/work/repo-a",
     // Like Pi: right after a compaction, usage is unknown (tokens: null) until the next response
@@ -41,7 +42,10 @@ function harness() {
           try { opts.onComplete(r); } finally { if (!explicit) usageOverride = undefined; }
         },
       }),
-    ui: { notify: () => {} },
+    ui: {
+      notices,
+      notify: (msg: string, level: string) => notices.push({ msg, level }),
+    },
     isIdle: () => idle,
     getContextUsage: () => usageOverride ?? { tokens: percent * 1000, contextWindow: 100000, percent },
   };
@@ -188,7 +192,7 @@ function harness() {
   assert.equal(h.sent.length, 1);
   assert.equal(h.sent[0].options.triggerTurn, true, "failed compaction must still resume the run");
   assert.match(h.sent[0].message.content, /NOT reduced/);
-  h.setPercent(85);
+  h.setPercent(90);
   await h.emit("turn_end");
   await h.settle();
   assert.equal(h.compacts.length, 1, "no auto-compact retry loop after a failure");
@@ -245,7 +249,7 @@ function harness() {
 // 2e. Loop bound: compaction that never restores headroom stops after 2 resumes
 {
   const h = harness();
-  h.setPercent(85);
+  h.setPercent(90);
   const resumes = () => h.sent.filter((m) => m.options.triggerTurn).length;
   for (let i = 0; i < 5; i++) {
     await h.emit("turn_end"); // still >= auto: schedules again
@@ -255,7 +259,7 @@ function harness() {
   assert.equal(resumes(), 2, "at most 2 consecutive compaction-driven resumes");
   h.setPercent(30);
   await h.emit("turn_end"); // headroom restored -> streak resets
-  h.setPercent(85);
+  h.setPercent(90);
   await h.emit("turn_end");
   await h.settle();
   h.compacts.at(-1).onComplete({});
@@ -308,7 +312,7 @@ function harness() {
   console.log("✓ note backup scoped per workspace with cwd header, sandboxed in tests");
 }
 
-// 3. turn_end: nudge once at 70–79%; at >=80% ask for notes once, then any other tool ends the turn
+// 3. turn_end: nudge once at 75–87%; at >=88% ask for notes once, then any other tool ends the turn
 {
   const h = harness();
   h.setPercent(75);
@@ -316,7 +320,7 @@ function harness() {
   await h.emit("turn_end");
   assert.equal(h.sent.length, 1, "nudge exactly once");
   assert.equal(h.sent[0].options.deliverAs, "steer");
-  h.setPercent(82);
+  h.setPercent(89);
   await h.emit("turn_end");
   await h.emit("turn_end");
   assert.equal(h.sent.length, 2, "one auto-compact steer, not repeated");
@@ -327,17 +331,17 @@ function harness() {
   assert.equal(blocked?.terminate, true, "ignoring the request ends the turn");
   await h.settle();
   assert.equal(h.compacts.length, 1);
-  assert.match(h.compacts[0].customInstructions, /Autonomous self-compaction at 82%/);
+  assert.match(h.compacts[0].customInstructions, /Autonomous self-compaction at 89%/);
   h.compacts[0].onComplete({});
   assert.equal(h.sent.at(-1)!.options.triggerTurn, true);
   // the model answering the request with its own notes replaces the generic note
   const h2 = harness();
-  h2.setPercent(82);
+  h2.setPercent(89);
   await h2.emit("turn_end");
   await h2.tools.get("self_compact").execute("c1", { note: "Goal: model-written" }, undefined, () => {}, h2.ctx);
   await h2.settle();
   assert.match(h2.compacts[0].customInstructions, /model-written/);
-  console.log("✓ turn_end: steer nudge once; at 80% the model gets one chance to write notes, else generic; never mid-run");
+  console.log("✓ turn_end: steer nudge once; at 88% the model gets one chance to write notes, else generic; never mid-run");
 }
 
 // 4. Pi built-in threshold compaction after agent_end → resume at settle exactly once
@@ -380,7 +384,7 @@ function harness() {
 // 6. Force gate and config validation
 {
   const h = harness();
-  h.setPercent(90);
+  h.setPercent(95);
   const g = await h.emit("tool_call", { toolName: "bash" });
   assert.equal(g?.block, true);
   assert.equal(g?.terminate, true, "force gate ends the turn and schedules a compaction");
@@ -396,6 +400,69 @@ function harness() {
   console.log("✓ force gate + threshold ordering");
 }
 
+// 7. Interactive /self-compact command controls and config file persistence
+{
+  const cfgFile = join(stateDir, "test-self-compact.json");
+  const { loadConfigFile, saveConfigFileAtomic, configFilePathFor } = await import("./index.ts");
+  
+  // Test saving and loading config
+  assert.equal(saveConfigFileAtomic(cfgFile, { nudgePct: 80, autoCompactPct: 90, forcePct: 96, enabled: false }), true);
+  const loaded = loadConfigFile(cfgFile);
+  assert.equal(loaded?.nudgePct, 80);
+  assert.equal(loaded?.autoCompactPct, 90);
+  assert.equal(loaded?.forcePct, 96);
+  assert.equal(loaded?.enabled, false);
+
+  const resolved = resolveConfig({} as any, cfgFile);
+  assert.equal(resolved.nudgePct, 80);
+  assert.equal(resolved.autoCompactPct, 90);
+  assert.equal(resolved.forcePct, 96);
+  assert.equal(resolved.enabled, false);
+
+  // Test interactive command subcommands
+  const h = harness();
+  const cmd = h.commands.get("self-compact");
+  assert.ok(cmd, "self-compact command must be registered");
+
+  // Status command
+  await cmd.handler("status", h.ctx);
+  assert.equal(h.ctx.ui.notices.length, 1);
+  assert.match(h.ctx.ui.notices[0].msg, /=== \[self-compact\] Status ===/);
+
+  // Disable / Enable
+  await cmd.handler("disable", h.ctx);
+  assert.match(h.ctx.ui.notices.at(-1)!.msg, /DISABLED/);
+  
+  // When disabled, turn_end and tool_call should not trigger auto-compact or force gate
+  h.setPercent(98);
+  await h.emit("turn_end");
+  assert.equal(h.sent.length, 0, "disabled: no steer nudge or auto-compact");
+  assert.equal(await h.emit("tool_call", { toolName: "bash" }), undefined, "disabled: no force gate");
+
+  await cmd.handler("enable", h.ctx);
+  assert.match(h.ctx.ui.notices.at(-1)!.msg, /ENABLED/);
+
+  // Set thresholds dynamically
+  await cmd.handler("set warning 80", h.ctx);
+  assert.match(h.ctx.ui.notices.at(-1)!.msg, /Nudge 80%/);
+  await cmd.handler("set auto 90", h.ctx);
+  assert.match(h.ctx.ui.notices.at(-1)!.msg, /Auto 90%/);
+  await cmd.handler("set force 96", h.ctx);
+  assert.match(h.ctx.ui.notices.at(-1)!.msg, /Force 96%/);
+  await cmd.handler("set window 300000", h.ctx);
+  assert.match(h.ctx.ui.notices.at(-1)!.msg, /300,000 tokens/);
+
+  // Invalid threshold ordering rejected
+  await cmd.handler("set warning 95", h.ctx);
+  assert.match(h.ctx.ui.notices.at(-1)!.msg, /Invalid thresholds/);
+
+  // Reset
+  await cmd.handler("reset", h.ctx);
+  assert.match(h.ctx.ui.notices.at(-1)!.msg, /Reset to defaults/);
+
+  console.log("✓ interactive /self-compact controls & config persistence");
+}
+
 console.log("\nALL TESTS PASSED");
 
 // Working-window cap: on a 1M-token model the thresholds are % of 200K, not of 1M
@@ -403,11 +470,12 @@ console.log("\nALL TESTS PASSED");
   const { usagePercent } = await import("./index.ts");
   const ctxOf = (u: any) => ({ getContextUsage: () => u }) as any;
   const big = { tokens: 160_000, contextWindow: 1_048_576, percent: 23 };
-  assert.equal(usagePercent(ctxOf(big), DEFAULT_CONFIG.workingWindowTokens), 80, "160K of a 200K working window = 80%");
+  assert.equal(usagePercent(ctxOf(big), 200_000), 80, "160K of a 200K working window = 80%");
+  assert.equal(usagePercent(ctxOf(big), DEFAULT_CONFIG.workingWindowTokens), 23, "default 0 disables the cap: Pi's own percent");
   assert.equal(usagePercent(ctxOf(big), 0), 23, "0 disables the cap: Pi's own percent");
   assert.equal(usagePercent(ctxOf({ tokens: 150_000, contextWindow: 200_000, percent: 75 }), 300_000), 75, "small windows unchanged");
   assert.equal(resolveConfig({ PI_SELF_COMPACT_WORKING_WINDOW: "0" } as any).workingWindowTokens, 0);
-  assert.equal(resolveConfig({ PI_SELF_COMPACT_WORKING_WINDOW: "x" } as any).workingWindowTokens, 200_000, "invalid → default");
+  assert.equal(resolveConfig({ PI_SELF_COMPACT_WORKING_WINDOW: "x" } as any).workingWindowTokens, 0, "invalid → default");
   console.log("✓ working-window cap: 1M models compact at 80% of 200K, small windows unchanged, env override");
 }
 
@@ -434,7 +502,7 @@ console.log("\nALL TESTS PASSED");
 // PI_SELF_COMPACT_WORKING_WINDOW: digits only AND a safe integer (400 digits parse to Infinity and would disable the cap)
 {
   const w = (v: string) => resolveConfig({ PI_SELF_COMPACT_WORKING_WINDOW: v } as any).workingWindowTokens;
-  for (const bad of ["9".repeat(400), "9007199254740993", "-1", "1e5", " 0", "0x10", "1.5", ""]) assert.equal(w(bad), 200_000, `${bad.slice(0, 20)} → default`);
+  for (const bad of ["9".repeat(400), "9007199254740993", "-1", "1e5", " 0", "0x10", "1.5", ""]) assert.equal(w(bad), 0, `${bad.slice(0, 20)} → default`);
   assert.equal(w("0"), 0, "0 = the whole window");
   assert.equal(w("9007199254740991"), 9007199254740991, "largest safe integer is accepted");
   assert.equal(w("300000"), 300_000);

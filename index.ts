@@ -9,9 +9,10 @@ import type {
 import { Type } from "@sinclair/typebox";
 
 // Context pressure thresholds (% of the working window, see workingWindowTokens). Pi's own auto-compaction
-// fires at contextWindow - reserveTokens (default 16384): ~92% on 200K, ~94% on 272K, ~98% on 1M. On windows
-// of 200K or less these stages sit before it, so the model gets to write its own continuation notes.
+// fires at contextWindow - reserveTokens (default 16384): ~92% on 200K, ~94% on 272K, ~98% on 1M.
+// Default thresholds (75/88/94) sit before Pi's built-in compaction while avoiding premature interruption.
 export interface SelfCompactConfig {
+  enabled: boolean; // master switch for autonomous threshold triggers and force gate
   nudgePct: number; // model-visible steer message asking for self_compact
   autoCompactPct: number; // compact autonomously with a generic note if the model ignored the nudge
   forcePct: number; // stop the run immediately (block + terminate) and compact with a generic note
@@ -20,14 +21,12 @@ export interface SelfCompactConfig {
 }
 
 export const DEFAULT_CONFIG: SelfCompactConfig = {
-  nudgePct: 70,
-  autoCompactPct: 80,
-  forcePct: 88,
+  enabled: true,
+  nudgePct: 75,
+  autoCompactPct: 88,
+  forcePct: 94,
   jevEnabled: true,
-  // On a 1M-token model, 70/80/88% of the whole window is ~734K/839K/922K: far past where answer quality
-  // drops, and Pi's own compaction (~98%) would only fire after all three. Quality, not window exhaustion,
-  // is the reason for the cap.
-  workingWindowTokens: 200_000,
+  workingWindowTokens: 0, // 0 = uncapped (full model context window)
 };
 
 function sanitizeThreshold(val: any, fallback: number, min = 10, max = 99): number {
@@ -159,22 +158,119 @@ export function writeNoteBackupAtomic(backupPath: string, content: string): bool
   }
 }
 
-export function resolveConfig(env: NodeJS.ProcessEnv = process.env): SelfCompactConfig {
-  const cfg: SelfCompactConfig = {
-    nudgePct: sanitizeThreshold(env.PI_SELF_COMPACT_WARNING_PCT, DEFAULT_CONFIG.nudgePct),
-    autoCompactPct: sanitizeThreshold(env.PI_SELF_COMPACT_AUTO_PCT, DEFAULT_CONFIG.autoCompactPct),
-    forcePct: sanitizeThreshold(env.PI_SELF_COMPACT_FORCE_PCT, DEFAULT_CONFIG.forcePct),
-    jevEnabled: env.PI_SELF_COMPACT_JEV !== "false",
-    // digits only and a safe integer: 400 digits parse to Infinity, which would silently disable the cap
-    workingWindowTokens: /^\d+$/.test(env.PI_SELF_COMPACT_WORKING_WINDOW ?? "") && Number.isSafeInteger(Number(env.PI_SELF_COMPACT_WORKING_WINDOW))
-      ? Number(env.PI_SELF_COMPACT_WORKING_WINDOW)
-      : DEFAULT_CONFIG.workingWindowTokens,
-  };
-  // Mis-ordered overrides would make a later stage fire first; fall back wholesale.
-  if (!(cfg.nudgePct < cfg.autoCompactPct && cfg.autoCompactPct < cfg.forcePct)) {
-    return { ...DEFAULT_CONFIG, jevEnabled: cfg.jevEnabled, workingWindowTokens: cfg.workingWindowTokens };
+export function configFilePathFor(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.PI_SELF_COMPACT_CONFIG_FILE?.trim()) return env.PI_SELF_COMPACT_CONFIG_FILE.trim();
+  const agentDir = env.PI_AGENT_DIR || join(homedir(), ".pi/agent");
+  return join(agentDir, "self-compact.json");
+}
+
+export function loadConfigFile(filePath: string): Partial<SelfCompactConfig> | null {
+  try {
+    if (existsSync(filePath)) {
+      const parsed = JSON.parse(readFileSync(filePath, "utf8"));
+      if (typeof parsed === "object" && parsed !== null) {
+        const out: Partial<SelfCompactConfig> = {};
+        if (typeof parsed.enabled === "boolean") out.enabled = parsed.enabled;
+        if (typeof parsed.autoCompact === "boolean") out.enabled = parsed.autoCompact;
+        if (typeof parsed.auto === "boolean") out.enabled = parsed.auto;
+
+        const nudge = parsed.nudgePct ?? parsed.warningPct ?? parsed.nudge;
+        if (nudge !== undefined) out.nudgePct = sanitizeThreshold(nudge, DEFAULT_CONFIG.nudgePct);
+
+        const auto = parsed.autoCompactPct ?? parsed.autoPct ?? parsed.auto;
+        if (typeof auto === "number" || (typeof auto === "string" && auto.trim() !== "")) {
+          out.autoCompactPct = sanitizeThreshold(auto, DEFAULT_CONFIG.autoCompactPct);
+        }
+
+        const force = parsed.forcePct ?? parsed.force;
+        if (force !== undefined) out.forcePct = sanitizeThreshold(force, DEFAULT_CONFIG.forcePct);
+
+        if (typeof parsed.jevEnabled === "boolean") out.jevEnabled = parsed.jevEnabled;
+        if (typeof parsed.jev === "boolean") out.jevEnabled = parsed.jev;
+
+        const win = parsed.workingWindowTokens ?? parsed.workingWindow ?? parsed.window;
+        if (win !== undefined) {
+          const winStr = String(win).trim();
+          if (/^\d+$/.test(winStr) && Number.isSafeInteger(Number(winStr))) {
+            out.workingWindowTokens = Number(winStr);
+          }
+        }
+        return out;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+export function saveConfigFileAtomic(filePath: string, config: Partial<SelfCompactConfig>): boolean {
+  try {
+    const dir = join(filePath, "..");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const tempFile = join(dir, `.tmp_sc_cfg_${Date.now()}_${Math.random().toString(36).slice(2)}.json`);
+    writeFileSync(tempFile, JSON.stringify(config, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+    renameSync(tempFile, filePath);
+    return true;
+  } catch {
+    return false;
   }
-  return cfg;
+}
+
+export function resolveConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  customConfigFile?: string,
+): SelfCompactConfig {
+  const cfgPath = customConfigFile ?? configFilePathFor(env);
+  const fileCfg = loadConfigFile(cfgPath) ?? {};
+
+  let enabled = fileCfg.enabled ?? DEFAULT_CONFIG.enabled;
+  if (env.PI_SELF_COMPACT_ENABLED !== undefined) {
+    const v = env.PI_SELF_COMPACT_ENABLED.trim().toLowerCase();
+    enabled = !(v === "false" || v === "0" || v === "off" || v === "no");
+  }
+
+  let jevEnabled = fileCfg.jevEnabled ?? DEFAULT_CONFIG.jevEnabled;
+  if (env.PI_SELF_COMPACT_JEV !== undefined) {
+    jevEnabled = env.PI_SELF_COMPACT_JEV.trim().toLowerCase() !== "false";
+  }
+
+  let workingWindowTokens = fileCfg.workingWindowTokens ?? DEFAULT_CONFIG.workingWindowTokens;
+  if (env.PI_SELF_COMPACT_WORKING_WINDOW !== undefined) {
+    const val = env.PI_SELF_COMPACT_WORKING_WINDOW.trim();
+    if (/^\d+$/.test(val) && Number.isSafeInteger(Number(val))) {
+      workingWindowTokens = Number(val);
+    }
+  }
+
+  let nudgePct = fileCfg.nudgePct ?? DEFAULT_CONFIG.nudgePct;
+  if (env.PI_SELF_COMPACT_WARNING_PCT !== undefined) {
+    nudgePct = sanitizeThreshold(env.PI_SELF_COMPACT_WARNING_PCT, nudgePct);
+  }
+
+  let autoCompactPct = fileCfg.autoCompactPct ?? DEFAULT_CONFIG.autoCompactPct;
+  if (env.PI_SELF_COMPACT_AUTO_PCT !== undefined) {
+    autoCompactPct = sanitizeThreshold(env.PI_SELF_COMPACT_AUTO_PCT, autoCompactPct);
+  }
+
+  let forcePct = fileCfg.forcePct ?? DEFAULT_CONFIG.forcePct;
+  if (env.PI_SELF_COMPACT_FORCE_PCT !== undefined) {
+    forcePct = sanitizeThreshold(env.PI_SELF_COMPACT_FORCE_PCT, forcePct);
+  }
+
+  // Validate threshold ordering: nudge < auto < force
+  if (!(nudgePct < autoCompactPct && autoCompactPct < forcePct)) {
+    nudgePct = DEFAULT_CONFIG.nudgePct;
+    autoCompactPct = DEFAULT_CONFIG.autoCompactPct;
+    forcePct = DEFAULT_CONFIG.forcePct;
+  }
+
+  return {
+    enabled,
+    nudgePct,
+    autoCompactPct,
+    forcePct,
+    jevEnabled,
+    workingWindowTokens,
+  };
 }
 
 const RUN_COMMAND = "self-compact-run"; // internal: Pi runs it once the settled session has drained
@@ -216,7 +312,7 @@ export function formatNoteBackup(cwd: string, note: string): string {
 const MAX_CONSECUTIVE_RESUMES = 2;
 
 export default function (pi: ExtensionAPI) {
-  const config = resolveConfig();
+  let config = resolveConfig();
   const jevApiKey = resolveJevApiKey();
 
   let compacting = false; // one of our own ctx.compact() calls is in flight
@@ -381,9 +477,124 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("self-compact", {
-    description: "Compact now, preserving optional continuation notes; resumes the agent if it was working",
+    description: "View status, configure thresholds, or trigger context compaction",
     handler: async (args, ctx) => {
-      const note = args?.trim().slice(0, 60000) || "Manual user-requested compaction.";
+      const trimmed = (args || "").trim();
+      const lower = trimmed.toLowerCase();
+
+      // Subcommand: status / help / empty
+      if (!trimmed || lower === "status" || lower === "help" || lower === "-h" || lower === "--help") {
+        const usage = ctx.getContextUsage?.();
+        const pct = safeUsage(ctx, config.workingWindowTokens);
+        const win = usage?.contextWindow ?? "unknown";
+        const tok = usage?.tokens ?? "unknown";
+        const capDesc = config.workingWindowTokens > 0 ? `${config.workingWindowTokens.toLocaleString()} tokens` : "uncapped (full model window)";
+        const statusMsg = [
+          "=== [self-compact] Status ===",
+          `• Autonomous Compaction: ${config.enabled ? "ENABLED" : "DISABLED (manual only)"}`,
+          `• Current Usage: ${pct !== null ? `${pct}%` : "unknown"} (${typeof tok === "number" ? tok.toLocaleString() : tok} / ${typeof win === "number" ? win.toLocaleString() : win} tokens)`,
+          `• Working Window: ${capDesc}`,
+          `• Thresholds: Nudge ${config.nudgePct}% | Auto ${config.autoCompactPct}% | Force ${config.forcePct}%`,
+          `• Jev Audit: ${config.jevEnabled ? "enabled" : "disabled"}`,
+          `• Config File: ${configFilePathFor()}`,
+          "",
+          "Commands:",
+          "  /self-compact status                 - Show this status",
+          "  /self-compact enable | disable       - Toggle autonomous compaction",
+          "  /self-compact set <key> <value>      - Set config (warning, auto, force, window, jev, enabled)",
+          "  /self-compact reset                  - Reset to default settings",
+          "  /self-compact <continuation note>    - Run manual compaction now",
+        ].join("\n");
+        safeNotify(ctx, statusMsg, "info");
+        return;
+      }
+
+      // Subcommand: enable / on
+      if (lower === "enable" || lower === "on") {
+        config.enabled = true;
+        saveConfigFileAtomic(configFilePathFor(), config);
+        safeNotify(ctx, "[self-compact] Autonomous compaction ENABLED.", "info");
+        return;
+      }
+
+      // Subcommand: disable / off
+      if (lower === "disable" || lower === "off") {
+        config.enabled = false;
+        saveConfigFileAtomic(configFilePathFor(), config);
+        safeNotify(ctx, "[self-compact] Autonomous compaction DISABLED. Manual compaction (/self-compact or tool) remains available.", "info");
+        return;
+      }
+
+      // Subcommand: reset
+      if (lower === "reset") {
+        config = { ...DEFAULT_CONFIG };
+        saveConfigFileAtomic(configFilePathFor(), config);
+        safeNotify(ctx, `[self-compact] Reset to defaults: Nudge ${config.nudgePct}%, Auto ${config.autoCompactPct}%, Force ${config.forcePct}%, Window uncapped (0).`, "info");
+        return;
+      }
+
+      // Subcommand: set <key> <val>
+      if (lower.startsWith("set ")) {
+        const parts = trimmed.slice(4).trim().split(/\s+/);
+        if (parts.length < 2) {
+          safeNotify(ctx, "Usage: /self-compact set <warning|auto|force|window|jev|enabled> <value>", "warning");
+          return;
+        }
+        const [keyRaw, valRaw] = parts;
+        const key = keyRaw.toLowerCase();
+        const val = valRaw.toLowerCase();
+
+        const newCfg = { ...config };
+        if (["warning", "warningpct", "nudge", "nudgepct"].includes(key)) {
+          const num = Number(val);
+          if (!Number.isFinite(num) || num < 10 || num > 99) {
+            safeNotify(ctx, "Warning threshold must be between 10 and 99.", "error");
+            return;
+          }
+          newCfg.nudgePct = Math.round(num);
+        } else if (["auto", "autopct", "autocompact", "autocompactpct"].includes(key)) {
+          const num = Number(val);
+          if (!Number.isFinite(num) || num < 10 || num > 99) {
+            safeNotify(ctx, "Auto-compact threshold must be between 10 and 99.", "error");
+            return;
+          }
+          newCfg.autoCompactPct = Math.round(num);
+        } else if (["force", "forcepct"].includes(key)) {
+          const num = Number(val);
+          if (!Number.isFinite(num) || num < 10 || num > 99) {
+            safeNotify(ctx, "Force threshold must be between 10 and 99.", "error");
+            return;
+          }
+          newCfg.forcePct = Math.round(num);
+        } else if (["window", "workingwindow", "workingwindowtokens"].includes(key)) {
+          if (!/^\d+$/.test(valRaw) || !Number.isSafeInteger(Number(valRaw))) {
+            safeNotify(ctx, "Working window must be a positive integer in tokens (0 for uncapped).", "error");
+            return;
+          }
+          newCfg.workingWindowTokens = Number(valRaw);
+        } else if (["jev", "jevenabled"].includes(key)) {
+          newCfg.jevEnabled = !(val === "false" || val === "0" || val === "off" || val === "no");
+        } else if (["enabled", "autocompact"].includes(key)) {
+          newCfg.enabled = !(val === "false" || val === "0" || val === "off" || val === "no");
+        } else {
+          safeNotify(ctx, `Unknown key '${keyRaw}'. Allowed: warning, auto, force, window, jev, enabled`, "error");
+          return;
+        }
+
+        // Validate threshold ordering
+        if (!(newCfg.nudgePct < newCfg.autoCompactPct && newCfg.autoCompactPct < newCfg.forcePct)) {
+          safeNotify(ctx, `Invalid thresholds: Nudge (${newCfg.nudgePct}%) must be < Auto (${newCfg.autoCompactPct}%) < Force (${newCfg.forcePct}%).`, "error");
+          return;
+        }
+
+        config = newCfg;
+        saveConfigFileAtomic(configFilePathFor(), config);
+        safeNotify(ctx, `[self-compact] Updated config: Nudge ${config.nudgePct}% | Auto ${config.autoCompactPct}% | Force ${config.forcePct}% | Window ${config.workingWindowTokens > 0 ? `${config.workingWindowTokens.toLocaleString()} tokens` : "uncapped"} | Auto ${config.enabled ? "on" : "off"}. Saved to ${configFilePathFor()}`, "info");
+        return;
+      }
+
+      // Default: manual compaction with note
+      const note = trimmed.replace(/^now\s+/i, "").trim().slice(0, 60000) || "Manual user-requested compaction.";
       resumeStreak = 0;
       pending = null; // the user's compaction replaces any scheduled one
       dispatched = null;
@@ -406,7 +617,7 @@ export default function (pi: ExtensionAPI) {
         reason: "[self-compact] A compaction is scheduled, so this turn is ending; the agent resumes automatically afterwards. Redo this call then if it is still needed.",
       };
     }
-    if (isSubagent() || compactionFailed) return;
+    if (!config.enabled || isSubagent() || compactionFailed) return;
     const percent = safeUsage(ctx, config.workingWindowTokens);
     if (percent === null || percent < config.forcePct) return;
     schedule(ctx, genericNote(percent));
@@ -426,6 +637,8 @@ export default function (pi: ExtensionAPI) {
     const percent = safeUsage(ctx, config.workingWindowTokens);
     if (percent === null) return;
     if (percent < config.autoCompactPct) resumeStreak = 0; // real progress with headroom
+
+    if (!config.enabled) return;
 
     if (percent >= config.autoCompactPct && !compactionFailed) {
       // Give the model one chance to write its own notes; any other tool call ends the turn (tool_call).
