@@ -6,7 +6,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 
 // Context pressure thresholds (% of the working window, see workingWindowTokens). Pi's own auto-compaction
 // fires at contextWindow - reserveTokens (default 16384): ~92% on 200K, ~94% on 272K, ~98% on 1M.
